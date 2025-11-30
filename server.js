@@ -543,6 +543,12 @@ const buildAvatar = (first, last) => {
   return `${firstInitial}${lastInitial}`.toUpperCase();
 };
 
+// Config endpoint - returns API URL for frontend
+app.get('/api/config', (req, res) => {
+  const apiUrl = process.env.API_URL || `http://localhost:${PORT}`;
+  res.json({ apiUrl });
+});
+
 // Login
 app.post('/api/auth/login', (req, res) => {
   try {
