@@ -125,6 +125,24 @@ const buildAvatar = (first, last) => {
 };
 
 // Config endpoint
+// ============ ROUTES ============
+
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({
+    message: 'College Hub Backend API',
+    status: 'running',
+    version: '1.0.0',
+    endpoints: {
+      health: '/api/health',
+      config: '/api/config',
+      auth: {
+        login: 'POST /api/auth/login'
+      }
+    }
+  });
+});
+
 app.get('/api/config', (req, res) => {
   const apiUrl = process.env.API_URL || `http://localhost:${PORT}`;
   res.json({ apiUrl });
