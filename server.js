@@ -1629,24 +1629,29 @@ app.use((err, req, res, _next) => {
   res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
 
-// Start server
-const server = app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
-
-server.on('error', (err) => {
-  console.error('Express failed to bind to port:', err.code || err.message);
-  console.error('Verify that nothing else is using the port and try again.');
-  process.exit(1);
-});
-
-// Graceful shutdown
-process.on('SIGINT', () => {
-  db.close((err) => {
-    if (err) {
-      console.error('Error closing database:', err.message);
-    }
-    console.log('Database connection closed');
-    process.exit(0);
+// Start server (only in local development)
+if (process.env.NODE_ENV !== 'production') {
+  const server = app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
   });
-});
+
+  server.on('error', (err) => {
+    console.error('Express failed to bind to port:', err.code || err.message);
+    console.error('Verify that nothing else is using the port and try again.');
+    process.exit(1);
+  });
+
+  // Graceful shutdown
+  process.on('SIGINT', () => {
+    db.close((err) => {
+      if (err) {
+        console.error('Error closing database:', err.message);
+      }
+      console.log('Database connection closed');
+      process.exit(0);
+    });
+  });
+}
+
+// Export for Vercel
+module.exports = app;
