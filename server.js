@@ -1017,6 +1017,84 @@ app.delete('/api/projects/:id', authenticateToken, requireAdmin, async (req, res
   }
 });
 
+// Get all parliament members
+app.get('/api/parliament/getAll', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM parliament ORDER BY position');
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching parliament members:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add parliament member
+app.post('/api/parliament/add', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { name, role, role_key, position, description, group_name, avatar, avatar_url } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO parliament (name, role, role_key, position, description, group_name, avatar, avatar_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [name, role, role_key, position, description, group_name, avatar, avatar_url]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error adding parliament member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update parliament member
+app.put('/api/parliament/update/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, role, role_key, position, description, group_name, avatar, avatar_url } = req.body;
+
+    const result = await pool.query(
+      `UPDATE parliament SET name=$1, role=$2, role_key=$3, position=$4, description=$5, group_name=$6, avatar=$7, avatar_url=$8
+       WHERE id=$9 RETURNING *`,
+      [name, role, role_key, position, description, group_name, avatar, avatar_url, id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error updating parliament member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Remove parliament member
+app.delete('/api/parliament/remove/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM parliament WHERE id=$1', [id]);
+    res.json({ message: 'Parliament member removed' });
+  } catch (error) {
+    console.error('Error removing parliament member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update parliament member avatar
+app.put('/api/parliament/:id/avatar', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { avatarUrl } = req.body;
+
+    const result = await pool.query(
+      'UPDATE parliament SET avatar_url=$1 WHERE id=$2 RETURNING *',
+      [avatarUrl, id]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error updating avatar:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Get schedule
 app.get('/api/schedule', authenticateToken, async (req, res) => {
   try {
