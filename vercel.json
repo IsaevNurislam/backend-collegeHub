@@ -1,18 +1,15 @@
 {
   "version": 2,
-  "buildCommand": "npm ci",
-  "outputDirectory": ".",
-  "functions": {
-    "server.js": {
-      "runtime": "nodejs@18.x",
-      "memory": 1024,
-      "maxDuration": 60
-    }
-  },
-  "rewrites": [
+  "builds": [
     {
-      "source": "/api/(.*)",
-      "destination": "/server.js"
+      "src": "server.js",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "server.js"
     }
   ]
 }
