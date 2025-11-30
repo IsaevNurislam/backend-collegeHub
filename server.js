@@ -987,6 +987,89 @@ app.get('/api/schedule', authenticateToken, async (req, res) => {
   }
 });
 
+
+// Get all projects
+app.get('/api/projects', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM projects ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching projects:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create project
+app.post('/api/projects', authenticateToken, async (req, res) => {
+  try {
+    const { title, status, needed, author, description } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO projects (title, status, needed, author, description, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [title, status, needed, author, description, new Date().toISOString()]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating project:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete project
+app.delete('/api/projects/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM projects WHERE id = $1', [id]);
+    res.json({ message: 'Project deleted' });
+  } catch (error) {
+    console.error('Error deleting project:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+// Get all projects
+app.get('/api/projects', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM projects ORDER BY created_at DESC');
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching projects:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create project
+app.post('/api/projects', authenticateToken, async (req, res) => {
+  try {
+    const { title, status, needed, author, description } = req.body;
+
+    const result = await pool.query(
+      INSERT INTO projects (title, status, needed, author, description, created_at)
+       VALUES (, , , , , ) RETURNING *,
+      [title, status, needed, author, description, new Date().toISOString()]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating project:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete project
+app.delete('/api/projects/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM projects WHERE id = ', [id]);
+    res.json({ message: 'Project deleted' });
+  } catch (error) {
+    console.error('Error deleting project:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 // Create schedule entry
 app.post('/api/schedule', authenticateToken, async (req, res) => {
   try {
@@ -1033,3 +1116,4 @@ if (process.env.NODE_ENV !== 'production') {
 
 // Export for Vercel
 module.exports = app;
+
