@@ -73,6 +73,7 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
+  exposedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.options('*', cors());
@@ -92,14 +93,22 @@ pool.on('error', (err) => {
 });
 
 // Test connection and initialize
+let dbConnected = false;
+
 pool.connect(async (err, client, release) => {
   if (err) {
     console.error('Database connection error:', err.message);
-    process.exit(1);
+    console.error('DATABASE_URL:', process.env.DATABASE_URL ? 'SET' : 'NOT SET');
+    console.warn('Server will start but database operations may fail');
   } else {
     console.log('Connected to PostgreSQL database');
+    dbConnected = true;
     release();
-    await initializeDatabase();
+    try {
+      await initializeDatabase();
+    } catch (error) {
+      console.error('Error initializing database:', error);
+    }
   }
 });
 
@@ -119,6 +128,25 @@ const buildAvatar = (first, last) => {
 app.get('/api/config', (req, res) => {
   const apiUrl = process.env.API_URL || `http://localhost:${PORT}`;
   res.json({ apiUrl });
+});
+
+// Health check endpoint
+app.get('/api/health', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT NOW()');
+    res.json({
+      status: 'ok',
+      database: 'connected',
+      timestamp: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Health check error:', error);
+    res.status(503).json({
+      status: 'error',
+      database: 'disconnected',
+      error: error.message
+    });
+  }
 });
 
 // Authentication middleware
