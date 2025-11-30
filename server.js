@@ -1,8 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
@@ -11,10 +10,8 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 
-// Email configuration using Gmail with app password
-// Note: Use environment variables in production
+// Email configuration
 const hasGmailConfig = process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD;
-
 let emailTransporter = null;
 
 if (hasGmailConfig) {
@@ -25,15 +22,11 @@ if (hasGmailConfig) {
       pass: process.env.GMAIL_APP_PASSWORD
     }
   });
-
-  // Don't verify - just try to send and handle errors
   console.log('Email transporter configured (credentials will be validated on first use)');
 } else {
-  // Use Ethereal for testing - automatically creates test account
   nodemailer.createTestAccount((err, testAccount) => {
     if (err) {
       console.log('Could not create Ethereal test account:', err.message);
-      console.log('Email will be logged to console only.');
     } else {
       emailTransporter = nodemailer.createTransport({
         host: testAccount.smtp.host,
@@ -44,14 +37,13 @@ if (hasGmailConfig) {
           pass: testAccount.pass
         }
       });
-
       console.log('📧 Test email account created');
       console.log('   View emails at:', testAccount.web);
     }
   });
 }
 
-// Global error handlers
+// Error handlers
 process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
   process.exit(1);
@@ -61,8 +53,7 @@ process.on('unhandledRejection', (reason) => {
   console.error('UNHANDLED REJECTION:', reason);
 });
 
-// Middleware
-// Explicit CORS configuration to allow Vite dev server origin and headers
+// CORS configuration
 const allowedOrigins = [
   /^http:\/\/localhost:\d+$/,
   /^http:\/\/127\.0\.0\.1:\d+$/,
@@ -83,96 +74,55 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }));
-// Handle preflight
+
 app.options('*', cors());
+
 const jsonLimit = process.env.JSON_LIMIT || '2mb';
 app.use(express.json({ limit: jsonLimit }));
 app.use(express.urlencoded({ extended: true, limit: jsonLimit }));
 
-// Database connection
-const db = new sqlite3.Database(path.join(__dirname, 'database.sqlite'), (err) => {
+// PostgreSQL connection pool
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
+
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle client', err);
+});
+
+// Test connection and initialize
+pool.connect(async (err, client, release) => {
   if (err) {
     console.error('Database connection error:', err.message);
-    console.error('Make sure the SQLite file exists and permissions allow read/write access.');
     process.exit(1);
-  }
-  console.log('Connected to SQLite database');
-  initializeDatabase();
-});
-
-db.on('error', (err) => {
-  console.error('Database error event:', err);
-});
-
-db.on('trace', (sql) => {
-  if (sql.includes('SELECT') || sql.includes('UPDATE')) {
-    console.log('SQL trace:', sql.substring(0, 100));
+  } else {
+    console.log('Connected to PostgreSQL database');
+    release();
+    await initializeDatabase();
   }
 });
 
-const ensureColumnExists = (table, column, definition) => {
-  db.all(`PRAGMA table_info(${table})`, (err, rows) => {
-    if (err) {
-      console.error(`Unable to read schema for ${table}:`, err);
-      return;
-    }
-    const exists = rows.some(row => row.name === column);
-    if (!exists) {
-      db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`,
-        (alterErr) => {
-          if (alterErr) {
-            console.error(`Failed to add column ${column} to ${table}:`, alterErr);
-          } else {
-            console.log(`Added missing column ${column} to ${table}`);
-          }
-        });
-    }
-  });
+// Helper functions
+const sanitizeNameInput = (input) => {
+  if (!input) return '';
+  return String(input).replace(/[<>]/g, '').slice(0, 50);
 };
 
-const ensureClubMembershipsTable = () => {
-  db.run(`CREATE TABLE IF NOT EXISTS club_memberships (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    clubId INTEGER NOT NULL,
-    userId INTEGER NOT NULL,
-    joinedAt TEXT NOT NULL,
-    FOREIGN KEY (clubId) REFERENCES clubs(id),
-    FOREIGN KEY (userId) REFERENCES users(id),
-    UNIQUE(clubId, userId)
-  )`);
+const buildAvatar = (first, last) => {
+  const firstInitial = first?.[0] || 'С';
+  const lastInitial = last?.[0] || 'Т';
+  return `${firstInitial}${lastInitial}`.toUpperCase();
 };
 
-const syncClubMembershipsFromUsers = () => {
-  db.get('SELECT COUNT(*) as count FROM club_memberships', (err, row) => {
-    if (err) {
-      console.error('Failed to inspect club_memberships:', err);
-      return;
-    }
-    if (row && row.count > 0) return;
-    db.each('SELECT id, joinedClubs FROM users', (userErr, user) => {
-      if (userErr || !user) return;
-      let joinedClubs = [];
-      try {
-        joinedClubs = JSON.parse(user.joinedClubs || '[]');
-      } catch (parseErr) {
-        console.error('Failed to parse joinedClubs for user', user.id, parseErr);
-        joinedClubs = [];
-      }
-      const now = new Date().toISOString();
-      joinedClubs.forEach((clubId) => {
-        const parsedId = parseInt(clubId);
-        if (!isNaN(parsedId)) {
-          db.run(`INSERT OR IGNORE INTO club_memberships (clubId, userId, joinedAt)
-                  VALUES (?, ?, ?)`,
-            [parsedId, user.id, now]);
-        }
-      });
-    });
-  });
-};
+// Config endpoint
+app.get('/api/config', (req, res) => {
+  const apiUrl = process.env.API_URL || `http://localhost:${PORT}`;
+  res.json({ apiUrl });
+});
 
 // Authentication middleware
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   try {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -199,361 +149,346 @@ const authenticateToken = (req, res, next) => {
   }
 };
 
-// Admin-only middleware
-const requireAdmin = (req, res, next) => {
-  db.get('SELECT isAdmin FROM users WHERE id = ?', [req.user.id], (err, user) => {
-    if (err || !user) return res.status(403).json({ error: 'Forbidden' });
-    if (user.isAdmin !== 1) return res.status(403).json({ error: 'Admin rights required' });
+// Admin middleware
+const requireAdmin = async (req, res, next) => {
+  try {
+    const result = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
+    if (result.rows.length === 0) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (!result.rows[0].is_admin) {
+      return res.status(403).json({ error: 'Admin rights required' });
+    }
     next();
-  });
+  } catch (error) {
+    console.error('Error in requireAdmin:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 };
 
-// Initialize database schema
-function initializeDatabase() {
-  db.serialize(() => {
-    // Users table
-    db.run(`CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      studentId TEXT UNIQUE NOT NULL,
-      name TEXT NOT NULL,
-      role TEXT,
-      isAdmin INTEGER DEFAULT 0,
-      avatar TEXT,
-      password TEXT NOT NULL,
-      joinedClubs TEXT DEFAULT '[]',
-      joinedProjects TEXT DEFAULT '[]',
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+// Initialize database
+async function initializeDatabase() {
+  try {
+    // Create tables
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        student_id VARCHAR(6) UNIQUE NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        role VARCHAR(255),
+        is_admin BOOLEAN DEFAULT FALSE,
+        avatar VARCHAR(255),
+        password VARCHAR(255) NOT NULL,
+        joined_clubs TEXT DEFAULT '[]',
+        joined_projects TEXT DEFAULT '[]',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-    // News table
-    db.run(`CREATE TABLE IF NOT EXISTS news (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      author TEXT NOT NULL,
-      authorKey TEXT,
-      time TEXT NOT NULL,
-      timeKey TEXT,
-      content TEXT NOT NULL,
-      contentKey TEXT,
-      tags TEXT,
-      tagsKeys TEXT,
-      likes INTEGER DEFAULT 0,
-      comments INTEGER DEFAULT 0,
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS news (
+        id SERIAL PRIMARY KEY,
+        author VARCHAR(255) NOT NULL,
+        author_key VARCHAR(255),
+        time VARCHAR(255) NOT NULL,
+        time_key VARCHAR(255),
+        content TEXT NOT NULL,
+        content_key VARCHAR(255),
+        tags TEXT,
+        tags_keys TEXT,
+        likes INTEGER DEFAULT 0,
+        comments INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-    // News likes table
-    db.run(`CREATE TABLE IF NOT EXISTS news_likes (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      newsId INTEGER NOT NULL,
-      userId INTEGER NOT NULL,
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (newsId) REFERENCES news(id),
-      FOREIGN KEY (userId) REFERENCES users(id),
-      UNIQUE(newsId, userId)
-    )`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS news_likes (
+        id SERIAL PRIMARY KEY,
+        news_id INTEGER NOT NULL REFERENCES news(id),
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(news_id, user_id)
+      )
+    `);
 
-    // Comments table
-    db.run(`CREATE TABLE IF NOT EXISTS comments (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      newsId INTEGER NOT NULL,
-      userId INTEGER NOT NULL,
-      text TEXT NOT NULL,
-      author TEXT NOT NULL,
-      authorId TEXT,
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (newsId) REFERENCES news(id),
-      FOREIGN KEY (userId) REFERENCES users(id)
-    )`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS comments (
+        id SERIAL PRIMARY KEY,
+        news_id INTEGER NOT NULL REFERENCES news(id),
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        text TEXT NOT NULL,
+        author VARCHAR(255) NOT NULL,
+        author_id VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-    // Clubs table
-    db.run(`CREATE TABLE IF NOT EXISTS clubs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      category TEXT NOT NULL,
-      categoryKey TEXT,
-      members INTEGER DEFAULT 0,
-      description TEXT,
-      descriptionKey TEXT,
-      color TEXT DEFAULT 'bg-blue-500',
-      instagram TEXT,
-      telegram TEXT,
-      whatsapp TEXT,
-      tiktok TEXT,
-      youtube TEXT,
-      website TEXT,
-      creatorId INTEGER,
-      creatorName TEXT,
-      photos TEXT DEFAULT '[]',
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS clubs (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        category VARCHAR(255) NOT NULL,
+        category_key VARCHAR(255),
+        members INTEGER DEFAULT 0,
+        description TEXT,
+        description_key VARCHAR(255),
+        color VARCHAR(50) DEFAULT 'bg-blue-500',
+        instagram VARCHAR(255),
+        telegram VARCHAR(255),
+        whatsapp VARCHAR(255),
+        tiktok VARCHAR(255),
+        youtube VARCHAR(255),
+        website VARCHAR(255),
+        creator_id INTEGER REFERENCES users(id),
+        creator_name VARCHAR(255),
+        photos TEXT DEFAULT '[]',
+        background_url VARCHAR(255),
+        background_type VARCHAR(50) DEFAULT 'color',
+        club_avatar VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-    // Projects table
-    db.run(`CREATE TABLE IF NOT EXISTS projects (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      title TEXT NOT NULL,
-      titleKey TEXT,
-      status TEXT NOT NULL,
-      needed TEXT,
-      neededKeys TEXT,
-      author TEXT NOT NULL,
-      clubId INTEGER,
-      backgroundUrl TEXT,
-      description TEXT,
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`, (err) => {
-      if (err) console.error('Error creating projects table:', err);
-      // Ensure description column exists for old databases
-      ensureColumnExists('projects', 'description', 'TEXT');
-    });
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS club_memberships (
+        id SERIAL PRIMARY KEY,
+        club_id INTEGER NOT NULL REFERENCES clubs(id),
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        joined_at TIMESTAMP NOT NULL,
+        UNIQUE(club_id, user_id)
+      )
+    `);
 
-    // Schedule table
-    db.run(`CREATE TABLE IF NOT EXISTS schedule (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      date TEXT NOT NULL,
-      time TEXT NOT NULL,
-      subject TEXT NOT NULL,
-      subjectKey TEXT,
-      room TEXT NOT NULL,
-      roomKey TEXT,
-      type TEXT,
-      color TEXT,
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        title_key VARCHAR(255),
+        status VARCHAR(50) NOT NULL,
+        needed TEXT,
+        needed_keys TEXT,
+        author VARCHAR(255) NOT NULL,
+        club_id INTEGER REFERENCES clubs(id),
+        background_url VARCHAR(255),
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-    // Activities table
-    db.run(`CREATE TABLE IF NOT EXISTS activities (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      userId INTEGER NOT NULL,
-      club TEXT NOT NULL,
-      action TEXT NOT NULL,
-      actionKey TEXT,
-      detail TEXT NOT NULL,
-      detailKey TEXT,
-      date TEXT NOT NULL,
-      dateKey TEXT,
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (userId) REFERENCES users(id)
-    )`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS schedule (
+        id SERIAL PRIMARY KEY,
+        date VARCHAR(50) NOT NULL,
+        time VARCHAR(50) NOT NULL,
+        subject VARCHAR(255) NOT NULL,
+        subject_key VARCHAR(255),
+        room VARCHAR(50) NOT NULL,
+        room_key VARCHAR(255),
+        type VARCHAR(50),
+        color VARCHAR(50),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-    // Parliament table
-    db.run(`CREATE TABLE IF NOT EXISTS parliament (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      role TEXT NOT NULL,
-      roleKey TEXT,
-      position TEXT,
-      description TEXT,
-      groupName TEXT,
-      avatar TEXT,
-      avatarUrl TEXT,
-      createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS activities (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        club VARCHAR(255) NOT NULL,
+        action VARCHAR(255) NOT NULL,
+        action_key VARCHAR(255),
+        detail TEXT NOT NULL,
+        detail_key VARCHAR(255),
+        date VARCHAR(50) NOT NULL,
+        date_key VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS parliament (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        role VARCHAR(255) NOT NULL,
+        role_key VARCHAR(255),
+        position VARCHAR(255),
+        description TEXT,
+        group_name VARCHAR(255),
+        avatar VARCHAR(255),
+        avatar_url VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
     console.log('Database schema initialized');
-    seedDatabase();
-    ensureColumnExists('clubs', 'creatorId', 'INTEGER DEFAULT NULL');
-    ensureColumnExists('clubs', 'creatorName', 'TEXT');
-    ensureColumnExists('clubs', 'photos', "TEXT DEFAULT '[]'");
-    ensureColumnExists('clubs', 'tiktok', 'TEXT');
-    ensureColumnExists('clubs', 'youtube', 'TEXT');
-    ensureColumnExists('clubs', 'website', 'TEXT');
-    ensureColumnExists('clubs', 'backgroundUrl', 'TEXT');
-    ensureColumnExists('clubs', 'backgroundType', "TEXT DEFAULT 'color'");
-    ensureColumnExists('clubs', 'clubAvatar', 'TEXT');
-    ensureColumnExists('projects', 'clubId', 'INTEGER');
-    ensureColumnExists('projects', 'backgroundUrl', 'TEXT');
-    ensureColumnExists('projects', 'description', 'TEXT');
-    ensureColumnExists('parliament', 'position', 'TEXT');
-    ensureColumnExists('parliament', 'description', 'TEXT');
-    ensureColumnExists('parliament', 'avatarUrl', 'TEXT');
-    ensureClubMembershipsTable();
-    syncClubMembershipsFromUsers();
-  });
+    await seedDatabase();
+  } catch (error) {
+    console.error('Error initializing database:', error);
+  }
 }
 
-// Seed initial data
-function seedDatabase() {
-  console.log('Starting seedDatabase...');
-  db.get("SELECT COUNT(*) as count FROM users", (err, row) => {
-    if (err) {
-      console.error('Error checking users:', err);
-      return;
-    }
-    if (row && row.count > 0) {
+// Seed database
+async function seedDatabase() {
+  try {
+    const userCount = await pool.query('SELECT COUNT(*) FROM users');
+    if (userCount.rows[0].count > 0) {
       console.log('Database already seeded, skipping...');
       return;
     }
-    
-    console.log('Seeding database with initial data...');
-    
-    // Create default user (6-digit studentId)
-    const hashedPassword = bcrypt.hashSync('123456', 10);
-    db.run(`INSERT INTO users (studentId, name, role, isAdmin, avatar, password, joinedClubs, joinedProjects) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ['123456', 'Алексей Смирнов', 'Студент, 2 курс', 0, 'АС', hashedPassword, JSON.stringify([1, 4]), JSON.stringify([1])],
-      (err) => { if (err) console.error('Error inserting user 1:', err); });
 
-    // Create admin user (6-digit studentId)
+    console.log('Seeding database with initial data...');
+
+    // Create default user
+    const hashedPassword = bcrypt.hashSync('123456', 10);
+    await pool.query(
+      `INSERT INTO users (student_id, name, role, is_admin, avatar, password, joined_clubs, joined_projects)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      ['123456', 'Алексей Смирнов', 'Студент, 2 курс', false, 'АС', hashedPassword, JSON.stringify([1, 4]), JSON.stringify([1])]
+    );
+
+    // Create admin user
     const adminPass = bcrypt.hashSync('admin123', 10);
-    db.run(`INSERT INTO users (studentId, name, role, isAdmin, avatar, password, joinedClubs, joinedProjects)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      ['000001', 'Админ Колледжа', 'Администратор', 1, 'АК', adminPass, '[]', '[]'],
-      (err) => { if (err) console.error('Error inserting user 2:', err); });
+    await pool.query(
+      `INSERT INTO users (student_id, name, role, is_admin, avatar, password, joined_clubs, joined_projects)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      ['000001', 'Админ Колледжа', 'Администратор', true, 'АК', adminPass, '[]', '[]']
+    );
 
     // Seed news
-    db.run(`INSERT INTO news (author, authorKey, time, timeKey, content, contentKey, tags, tagsKeys, likes, comments)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ["Студенческий Совет", 'news.author.council', "2 часа назад", 'news.time.2h', 
+    await pool.query(
+      `INSERT INTO news (author, author_key, time, time_key, content, content_key, tags, tags_keys, likes, comments)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      ["Студенческий Совет", 'news.author.council', "2 часа назад", 'news.time.2h',
        "🎉 Приглашаем всех на ежегодный хакатон 'Campus Code 2025'! Регистрация открыта до пятницы.",
-       'news.content.hackathon', JSON.stringify(["Событие", "IT"]), JSON.stringify(['tags.event', 'tags.it']), 45, 12],
-      (err) => { if (err) console.error('Error inserting news 1:', err); });
+       'news.content.hackathon', JSON.stringify(["Событие", "IT"]), JSON.stringify(['tags.event', 'tags.it']), 45, 12]
+    );
 
-    db.run(`INSERT INTO news (author, authorKey, time, timeKey, content, contentKey, tags, tagsKeys, likes, comments)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    await pool.query(
+      `INSERT INTO news (author, author_key, time, time_key, content, content_key, tags, tags_keys, likes, comments)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       ["Клуб Робототехники", 'news.author.robotics_club', "5 часов назад", 'news.time.5h',
        "Ищем инженеров в команду для подготовки к битве роботов. Опыт не важен, главное желание учиться!",
-       'news.content.robotics_recruit', JSON.stringify(["Клубы", "Набор"]), JSON.stringify(['tags.clubs', 'tags.recruit']), 28, 5],
-      (err) => { if (err) console.error('Error inserting news 2:', err); });
+       'news.content.robotics_recruit', JSON.stringify(["Клубы", "Набор"]), JSON.stringify(['tags.clubs', 'tags.recruit']), 28, 5]
+    );
 
     // Seed clubs
-        db.run(`INSERT INTO clubs (name, category, categoryKey, members, description, descriptionKey, color, instagram, telegram, whatsapp, creatorId, creatorName, photos)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ["Debate Club", "Общество", 'clubs.categories.society', 120, 
+    await pool.query(
+      `INSERT INTO clubs (name, category, category_key, members, description, description_key, color, instagram, telegram, whatsapp, creator_id, creator_name, photos)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      ["Debate Club", "Общество", 'clubs.categories.society', 120,
        "Искусство спора и риторики.", 'clubs.descriptions.debate',
-       "bg-blue-500", "@debate_club", "@debateclub", "+996700123456", 2, 'Админ Колледжа', JSON.stringify([])],
-      (err) => { if (err) console.error('Error inserting club 1:', err); });
+       "bg-blue-500", "@debate_club", "@debateclub", "+996700123456", 2, 'Админ Колледжа', JSON.stringify([])]
+    );
 
-        db.run(`INSERT INTO clubs (name, category, categoryKey, members, description, descriptionKey, color, instagram, telegram, whatsapp, creatorId, creatorName, photos)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    await pool.query(
+      `INSERT INTO clubs (name, category, category_key, members, description, description_key, color, instagram, telegram, whatsapp, creator_id, creator_name, photos)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       ["Eco Campus", "Экология", 'clubs.categories.ecology', 85,
        "Делаем наш университет зеленым.", 'clubs.descriptions.eco',
-       "bg-green-500", "@eco_campus", "@ecocampus", "", 2, 'Админ Колледжа', JSON.stringify([])],
-      (err) => { if (err) console.error('Error inserting club 2:', err); });
+       "bg-green-500", "@eco_campus", "@ecocampus", "", 2, 'Админ Колледжа', JSON.stringify([])]
+    );
 
-        db.run(`INSERT INTO clubs (name, category, categoryKey, members, description, descriptionKey, color, instagram, telegram, whatsapp, creatorId, creatorName, photos)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    await pool.query(
+      `INSERT INTO clubs (name, category, category_key, members, description, description_key, color, instagram, telegram, whatsapp, creator_id, creator_name, photos)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       ["Art Studio", "Творчество", 'clubs.categories.creativity', 200,
        "Рисование, дизайн и выставки.", 'clubs.descriptions.art_studio',
-       "bg-purple-500", "@art_studio", "", "", 2, 'Админ Колледжа', JSON.stringify([])],
-      (err) => { if (err) console.error('Error inserting club 3:', err); });
+       "bg-purple-500", "@art_studio", "", "", 2, 'Админ Колледжа', JSON.stringify([])]
+    );
 
-        db.run(`INSERT INTO clubs (name, category, categoryKey, members, description, descriptionKey, color, instagram, telegram, whatsapp, creatorId, creatorName, photos)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    await pool.query(
+      `INSERT INTO clubs (name, category, category_key, members, description, description_key, color, instagram, telegram, whatsapp, creator_id, creator_name, photos)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       ["Tech Innovators", "Наука", 'clubs.categories.science', 150,
        "Разработка ПО и гаджетов.", 'clubs.descriptions.tech_innovators',
-       "bg-sky-600", "@tech_innovators", "@techinnovators", "+996700654321", 2, 'Админ Колледжа', JSON.stringify([])],
-      (err) => { if (err) console.error('Error inserting club 4:', err); });
+       "bg-sky-600", "@tech_innovators", "@techinnovators", "+996700654321", 2, 'Админ Колледжа', JSON.stringify([])]
+    );
 
     // Seed schedule
-    db.run(`INSERT INTO schedule (date, time, subject, subjectKey, room, roomKey, type, color)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    await pool.query(
+      `INSERT INTO schedule (date, time, subject, subject_key, room, room_key, type, color)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       ["2025-11-28", "08:30 - 10:00", "Высшая математика", 'schedule.subject.math',
-       "Ауд. 305", 'schedule.room.305', "lecture", "border-blue-500"],
-      (err) => { if (err) console.error('Error inserting schedule 1:', err); });
+       "Ауд. 305", 'schedule.room.305', "lecture", "border-blue-500"]
+    );
 
-    db.run(`INSERT INTO schedule (date, time, subject, subjectKey, room, roomKey, type, color)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    await pool.query(
+      `INSERT INTO schedule (date, time, subject, subject_key, room, room_key, type, color)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       ["2025-11-28", "10:15 - 11:45", "Веб-разработка", 'schedule.subject.webdev',
-       "Комп. класс 2", 'schedule.room.lab2', "lab", "border-green-500"],
-      (err) => { if (err) console.error('Error inserting schedule 2:', err); });
+       "Комп. класс 2", 'schedule.room.lab2', "lab", "border-green-500"]
+    );
 
-    db.run(`INSERT INTO schedule (date, time, subject, subjectKey, room, roomKey, type, color)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    await pool.query(
+      `INSERT INTO schedule (date, time, subject, subject_key, room, room_key, type, color)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       ["2025-11-29", "12:30 - 14:00", "Философия", 'schedule.subject.philosophy',
-       "Ауд. 101", 'schedule.room.101', "seminar", "border-yellow-500"],
-      (err) => { if (err) console.error('Error inserting schedule 3:', err); });
+       "Ауд. 101", 'schedule.room.101', "seminar", "border-yellow-500"]
+    );
 
     // Seed projects
-        db.run(`INSERT INTO projects (title, titleKey, status, needed, neededKeys, author, clubId)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    await pool.query(
+      `INSERT INTO projects (title, title_key, status, needed, needed_keys, author, club_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       ["Умная теплица", 'projects.title.smart_greenhouse', "developing",
-       JSON.stringify(["Frontend", "Biologist"]), JSON.stringify(['roles.frontend','roles.biologist']), "Иван К.", 4],
-      (err) => { if (err) console.error('Error inserting project 1:', err); });
+       JSON.stringify(["Frontend", "Biologist"]), JSON.stringify(['roles.frontend','roles.biologist']), "Иван К.", 4]
+    );
 
-        db.run(`INSERT INTO projects (title, titleKey, status, needed, neededKeys, author, clubId)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    await pool.query(
+      `INSERT INTO projects (title, title_key, status, needed, needed_keys, author, club_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       ["College Hub App", 'projects.title.college_hub_app', "mvp",
-       JSON.stringify(["Marketing"]), JSON.stringify(['roles.marketing']), "Мария Л.", 1],
-      (err) => { if (err) console.error('Error inserting project 2:', err); });
+       JSON.stringify(["Marketing"]), JSON.stringify(['roles.marketing']), "Мария Л.", 1]
+    );
 
-        db.run(`INSERT INTO projects (title, titleKey, status, needed, neededKeys, author, clubId)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    await pool.query(
+      `INSERT INTO projects (title, title_key, status, needed, needed_keys, author, club_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       ["Короткометражный фильм", 'projects.title.short_film', "script",
-       JSON.stringify(["Actor", "Editor"]), JSON.stringify(['roles.actor','roles.editor']), "Киноклуб", 3],
-      (err) => { if (err) console.error('Error inserting project 3:', err); });
+       JSON.stringify(["Actor", "Editor"]), JSON.stringify(['roles.actor','roles.editor']), "Киноклуб", 3]
+    );
 
     // Seed parliament
-    db.run(`INSERT INTO parliament (name, role, roleKey, position, description, groupName, avatar, avatarUrl)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        'Ayana Omoshova',
-        'Президент',
-        'parliament.roles.president',
-        'Председатель Студенческого парламента',
-        'Координирует работу парламентской группы, отвечает за встречи и инициативы.',
-        'MAN-28',
-        'AO',
-        null
-      ],
-      (err) => { if (err) console.error('Error inserting parliament 1:', err); });
+    await pool.query(
+      `INSERT INTO parliament (name, role, role_key, position, description, group_name, avatar, avatar_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      ['Ayana Omoshova', 'Президент', 'parliament.roles.president',
+       'Председатель Студенческого парламента',
+       'Координирует работу парламентской группы, отвечает за встречи и инициативы.',
+       'MAN-28', 'AO', null]
+    );
 
-    db.run(`INSERT INTO parliament (name, role, roleKey, position, description, groupName, avatar, avatarUrl)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        'Saikal Mambetova',
-        'Вице-президент',
-        'parliament.roles.vice_president',
-        'Заместитель председателя',
-        'Помогает координировать проекты и поддерживает связь с клубами.',
-        'FIN-28A',
-        'SM',
-        null
-      ],
-      (err) => { if (err) console.error('Error inserting parliament 2:', err); });
+    await pool.query(
+      `INSERT INTO parliament (name, role, role_key, position, description, group_name, avatar, avatar_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      ['Saikal Mambetova', 'Вице-президент', 'parliament.roles.vice_president',
+       'Заместитель председателя',
+       'Помогает координировать проекты и поддерживает связь с клубами.',
+       'FIN-28A', 'SM', null]
+    );
 
-    db.run(`INSERT INTO parliament (name, role, roleKey, position, description, groupName, avatar, avatarUrl)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        'Darina Matveenko',
-        'Куратор проекта «Дебатный клуб»',
-        'parliament.roles.curator_debate',
-        'Куратор дебатного направления',
-        'Отвечает за набор новых участников и проведениe дебатных батлов.',
-        'MAN-28',
-        'DM',
-        null
-      ], 
-      (err) => {
-        if (err) {
-          console.error('Error seeding database:', err);
-        } else {
-          console.log('Database seeded successfully');
-        }
-      });
-  });
+    await pool.query(
+      `INSERT INTO parliament (name, role, role_key, position, description, group_name, avatar, avatar_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      ['Darina Matveenko', 'Куратор проекта «Дебатный клуб»', 'parliament.roles.curator_debate',
+       'Куратор дебатного направления',
+       'Отвечает за набор новых участников и проведениe дебатных батлов.',
+       'MAN-28', 'DM', null]
+    );
+
+    console.log('Database seeded successfully');
+  } catch (error) {
+    console.error('Error seeding database:', error);
+  }
 }
 
-// ============= AUTH ROUTES =============
+// ============ ROUTES ============
 
-const sanitizeNameInput = (value) => (typeof value === 'string' ? value.trim() : '');
-const buildDisplayName = (first, last) => (first && last ? `${first} ${last}` : 'Студент');
-const buildAvatar = (first, last) => {
-  const firstInitial = first?.[0] || 'С';
-  const lastInitial = last?.[0] || 'Т';
-  return `${firstInitial}${lastInitial}`.toUpperCase();
-};
-
-// Config endpoint - returns API URL for frontend
-app.get('/api/config', (req, res) => {
-  const apiUrl = process.env.API_URL || `http://localhost:${PORT}`;
-  res.json({ apiUrl });
-});
-
-// Login
-app.post('/api/auth/login', (req, res) => {
+// Login route
+app.post('/api/auth/login', async (req, res) => {
   try {
     const { studentId, password, firstName, lastName } = req.body;
-
     const cleanedFirstName = sanitizeNameInput(firstName);
     const cleanedLastName = sanitizeNameInput(lastName);
 
@@ -561,1076 +496,472 @@ app.post('/api/auth/login', (req, res) => {
       return res.status(400).json({ error: 'Student ID and password required' });
     }
 
-    // Validate studentId (exactly 6 digits)
     if (!/^\d{6}$/.test(studentId)) {
       return res.status(422).json({ error: 'Student ID must be exactly 6 digits' });
     }
 
-    db.get('SELECT * FROM users WHERE studentId = ?', [studentId], (err, user) => {
-      try {
-        if (err) {
-          return res.status(500).json({ error: 'Database error' });
-        }
+    // Try to find user
+    const userResult = await pool.query('SELECT * FROM users WHERE student_id = $1', [studentId]);
+    let user = userResult.rows[0];
 
-        if (!user) {
-          // Create new user if doesn't exist
-          const hashedPassword = bcrypt.hashSync(password, 10);
-          const name = buildDisplayName(cleanedFirstName, cleanedLastName);
-          const avatar = buildAvatar(cleanedFirstName, cleanedLastName);
+    if (user) {
+      // User exists - verify password
+      const passwordMatch = bcrypt.compareSync(password, user.password);
+      if (!passwordMatch) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
+    } else {
+      // New user - create account
+      if (!cleanedFirstName || !cleanedLastName) {
+        return res.status(400).json({ error: 'First name and last name required for new users' });
+      }
 
-          db.run(`INSERT INTO users (studentId, name, role, avatar, password, joinedClubs, joinedProjects)
-                  VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [studentId, name, 'Студент, 2 курс', avatar, hashedPassword, '[]', '[]'],
-            function(err) {
-              try {
-                if (err) {
-                  return res.status(500).json({ error: 'Failed to create user' });
-                }
+      const hashedPassword = bcrypt.hashSync(password, 10);
+      const avatar = buildAvatar(cleanedFirstName, cleanedLastName);
+      const fullName = `${cleanedFirstName} ${cleanedLastName}`;
 
-                const token = jwt.sign({ id: this.lastID, studentId }, JWT_SECRET, { expiresIn: '7d' });
-                res.json({
-                  token,
-                  user: {
-                    id: this.lastID,
-                    studentId,
-                    name,
-                    role: 'Студент, 2 курс',
-                    avatar,
-                    joinedClubs: [],
-                    joinedProjects: []
-                  }
-                });
-              } catch (e) {
-                console.error('Error in db.run callback:', e);
-                res.status(500).json({ error: 'Internal server error' });
-              }
-            });
-        } else {
-          // Verify password
-          if (!bcrypt.compareSync(password, user.password)) {
-            return res.status(401).json({ error: 'Invalid credentials' });
-          }
+      const createResult = await pool.query(
+        `INSERT INTO users (student_id, name, role, avatar, password, joined_clubs, joined_projects)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+        [studentId, fullName, 'Студент', avatar, hashedPassword, '[]', '[]']
+      );
+      user = createResult.rows[0];
+    }
 
-          const token = jwt.sign({ id: user.id, studentId: user.studentId }, JWT_SECRET, { expiresIn: '7d' });
-          res.json({
-            token,
-            user: {
-              id: user.id,
-              studentId: user.studentId,
-              name: user.name,
-              role: user.role,
-              avatar: user.avatar,
-              isAdmin: user.isAdmin === 1,
-              joinedClubs: JSON.parse(user.joinedClubs || '[]'),
-              joinedProjects: JSON.parse(user.joinedProjects || '[]')
-            }
-          });
-        }
-      } catch (e) {
-        console.error('Error in db.get callback:', e);
-        res.status(500).json({ error: 'Internal server error' });
+    // Generate JWT token
+    const token = jwt.sign(
+      { id: user.id, studentId: user.student_id, name: user.name },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        studentId: user.student_id,
+        name: user.name,
+        role: user.role,
+        isAdmin: user.is_admin,
+        avatar: user.avatar
       }
     });
   } catch (error) {
-    console.error('Error in login endpoint:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    console.error('Login error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
 // Get current user
-app.get('/api/user/me', authenticateToken, (req, res) => {
-  db.get('SELECT * FROM users WHERE id = ?', [req.user.id], (err, user) => {
-    if (err || !user) {
+app.get('/api/user/me', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    const user = result.rows[0];
+
+    if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
     res.json({
       id: user.id,
-      studentId: user.studentId,
+      studentId: user.student_id,
       name: user.name,
       role: user.role,
-      avatar: user.avatar,
-      isAdmin: user.isAdmin === 1,
-      joinedClubs: JSON.parse(user.joinedClubs || '[]'),
-      joinedProjects: JSON.parse(user.joinedProjects || '[]')
+      isAdmin: user.is_admin,
+      avatar: user.avatar
     });
-  });
+  } catch (error) {
+    console.error('Error fetching user:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Update user profile
-app.put('/api/user/profile', authenticateToken, (req, res) => {
-  const { name, role } = req.body;
-  const avatar = name ? `${name.split(' ')[0][0]}${name.split(' ')[1]?.[0] || 'S'}`.toUpperCase() : null;
+app.put('/api/user/profile', authenticateToken, async (req, res) => {
+  try {
+    const { name, role } = req.body;
+    const cleanedName = sanitizeNameInput(name);
 
-  db.run(`UPDATE users SET name = COALESCE(?, name), role = COALESCE(?, role), avatar = COALESCE(?, avatar)
-          WHERE id = ?`,
-    [name, role, avatar, req.user.id],
-    function(err) {
-      if (err) {
-        return res.status(500).json({ error: 'Failed to update profile' });
-      }
+    if (!cleanedName || !role) {
+      return res.status(400).json({ error: 'Name and role required' });
+    }
 
-      db.get('SELECT * FROM users WHERE id = ?', [req.user.id], (err, user) => {
-        res.json({
-          id: user.id,
-          studentId: user.studentId,
-          name: user.name,
-          role: user.role,
-          avatar: user.avatar,
-          joinedClubs: JSON.parse(user.joinedClubs || '[]'),
-          joinedProjects: JSON.parse(user.joinedProjects || '[]')
-        });
-      });
+    const result = await pool.query(
+      'UPDATE users SET name = $1, role = $2 WHERE id = $3 RETURNING *',
+      [cleanedName, role, req.user.id]
+    );
+
+    res.json({
+      id: result.rows[0].id,
+      name: result.rows[0].name,
+      role: result.rows[0].role
     });
+  } catch (error) {
+    console.error('Error updating profile:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
-
-// ============= NEWS ROUTES =============
 
 // Get all news
-app.get('/api/news', authenticateToken, (req, res) => {
-  db.all('SELECT * FROM news ORDER BY createdAt DESC', (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: 'Failed to fetch news' });
-    }
-
-    // Get user's likes
-    db.all('SELECT newsId FROM news_likes WHERE userId = ?', [req.user.id], (err, likes) => {
-      const likedIds = likes ? likes.map(l => l.newsId) : [];
-      
-      const news = rows.map(row => ({
-        id: row.id,
-        author: row.author,
-        authorKey: row.authorKey,
-        time: row.time,
-        timeKey: row.timeKey,
-        content: row.content,
-        contentKey: row.contentKey,
-        tags: JSON.parse(row.tags || '[]'),
-        tagsKeys: JSON.parse(row.tagsKeys || '[]'),
-        likes: row.likes,
-        comments: row.comments,
-        liked: likedIds.includes(row.id)
-      }));
-
-      res.json(news);
-    });
-  });
+app.get('/api/news', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM news ORDER BY created_at DESC LIMIT 100'
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching news:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// Admin: create news
-app.post('/api/news', authenticateToken, requireAdmin, (req, res) => {
-  const { author, content, tags } = req.body;
-  const time = 'только что';
-  db.run(`INSERT INTO news (author, time, content, tags, likes, comments)
-          VALUES (?, ?, ?, ?, 0, 0)`,
-    [author || 'Админ Колледжа', time, content, JSON.stringify(tags || [])],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to add news' });
-      db.get('SELECT * FROM news WHERE id = ?', [this.lastID], (err, row) => {
-        if (err || !row) return res.status(500).json({ error: 'Failed to fetch created news' });
-        res.json({
-          id: row.id,
-          author: row.author,
-          time: row.time,
-          content: row.content,
-          tags: JSON.parse(row.tags || '[]'),
-          likes: row.likes,
-          comments: row.comments,
-          liked: false
-        });
-      });
-    }
-  );
+// Create news
+app.post('/api/news', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { author, time, content, tags } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO news (author, time, content, tags, likes, comments)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [author, time, content, JSON.stringify(tags || []), 0, 0]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating news:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// Admin: delete news
-app.delete('/api/news/:id', authenticateToken, requireAdmin, (req, res) => {
-  const newsId = parseInt(req.params.id);
-  
-  // Delete all comments for this news
-  db.run('DELETE FROM comments WHERE newsId = ?', [newsId], (err) => {
-    if (err) console.error('Failed to delete comments:', err);
-    
-    // Delete all likes for this news
-    db.run('DELETE FROM news_likes WHERE newsId = ?', [newsId], (err) => {
-      if (err) console.error('Failed to delete likes:', err);
-      
-      // Delete the news itself
-      db.run('DELETE FROM news WHERE id = ?', [newsId], function(err) {
-        if (err) return res.status(500).json({ error: 'Failed to delete news' });
-        if (this.changes === 0) return res.status(404).json({ error: 'News not found' });
-        res.json({ success: true });
-      });
-    });
-  });
+// Delete news
+app.delete('/api/news/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM news WHERE id = $1', [id]);
+    res.json({ message: 'News deleted' });
+  } catch (error) {
+    console.error('Error deleting news:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// Like/unlike news
-app.post('/api/news/:id/like', authenticateToken, (req, res) => {
-  const newsId = parseInt(req.params.id);
+// Like news
+app.post('/api/news/:id/like', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
 
-  db.get('SELECT * FROM news_likes WHERE newsId = ? AND userId = ?', [newsId, req.user.id], (err, like) => {
-    if (like) {
+    // Check if already liked
+    const checkResult = await pool.query(
+      'SELECT * FROM news_likes WHERE news_id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+
+    if (checkResult.rows.length > 0) {
       // Unlike
-      db.run('DELETE FROM news_likes WHERE newsId = ? AND userId = ?', [newsId, req.user.id], (err) => {
-        if (err) return res.status(500).json({ error: 'Failed to unlike' });
-        
-        db.run('UPDATE news SET likes = likes - 1 WHERE id = ?', [newsId], (err) => {
-          if (err) return res.status(500).json({ error: 'Failed to update likes' });
-          
-          db.get('SELECT * FROM news WHERE id = ?', [newsId], (err, news) => {
-            res.json({ ...news, liked: false, tags: JSON.parse(news.tags || '[]'), tagsKeys: JSON.parse(news.tagsKeys || '[]') });
-          });
-        });
-      });
+      await pool.query(
+        'DELETE FROM news_likes WHERE news_id = $1 AND user_id = $2',
+        [id, req.user.id]
+      );
+      const newsResult = await pool.query(
+        'UPDATE news SET likes = likes - 1 WHERE id = $1 RETURNING likes',
+        [id]
+      );
+      return res.json({ likes: newsResult.rows[0].likes, liked: false });
     } else {
       // Like
-      db.run('INSERT INTO news_likes (newsId, userId) VALUES (?, ?)', [newsId, req.user.id], (err) => {
-        if (err) return res.status(500).json({ error: 'Failed to like' });
-        
-        db.run('UPDATE news SET likes = likes + 1 WHERE id = ?', [newsId], (err) => {
-          if (err) return res.status(500).json({ error: 'Failed to update likes' });
-          
-          db.get('SELECT * FROM news WHERE id = ?', [newsId], (err, news) => {
-            res.json({ ...news, liked: true, tags: JSON.parse(news.tags || '[]'), tagsKeys: JSON.parse(news.tagsKeys || '[]') });
-          });
-        });
-      });
+      await pool.query(
+        'INSERT INTO news_likes (news_id, user_id) VALUES ($1, $2)',
+        [id, req.user.id]
+      );
+      const newsResult = await pool.query(
+        'UPDATE news SET likes = likes + 1 WHERE id = $1 RETURNING likes',
+        [id]
+      );
+      res.json({ likes: newsResult.rows[0].likes, liked: true });
     }
-  });
+  } catch (error) {
+    console.error('Error liking news:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// Get comments for news
-app.get('/api/news/:id/comments', authenticateToken, (req, res) => {
-  const newsId = parseInt(req.params.id);
-  
-  db.all('SELECT * FROM comments WHERE newsId = ? ORDER BY createdAt ASC', [newsId], (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: 'Failed to fetch comments' });
-    }
-    res.json(rows);
-  });
+// Get comments
+app.get('/api/news/:id/comments', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'SELECT * FROM comments WHERE news_id = $1 ORDER BY created_at DESC',
+      [id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching comments:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Add comment
-app.post('/api/news/:id/comments', authenticateToken, (req, res) => {
-  const newsId = parseInt(req.params.id);
-  const { text } = req.body;
+app.post('/api/news/:id/comments', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { text } = req.body;
 
-  db.get('SELECT * FROM users WHERE id = ?', [req.user.id], (err, user) => {
-    if (err || !user) return res.status(404).json({ error: 'User not found' });
+    const userResult = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const author = userResult.rows[0].name;
 
-    db.run(`INSERT INTO comments (newsId, userId, text, author, authorId)
-            VALUES (?, ?, ?, ?, ?)`,
-      [newsId, req.user.id, text, user.name, user.studentId],
-      function(err) {
-        if (err) return res.status(500).json({ error: 'Failed to add comment' });
+    const result = await pool.query(
+      `INSERT INTO comments (news_id, user_id, text, author, author_id)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [id, req.user.id, text, author, req.user.id]
+    );
 
-        db.run('UPDATE news SET comments = comments + 1 WHERE id = ?', [newsId]);
-
-        res.json({
-          id: this.lastID,
-          newsId,
-          text,
-          author: user.name,
-          authorId: user.studentId,
-          createdAt: new Date().toISOString()
-        });
-      });
-  });
+    await pool.query('UPDATE news SET comments = comments + 1 WHERE id = $1', [id]);
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error adding comment:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Update comment
-app.put('/api/news/:newsId/comments/:commentId', authenticateToken, (req, res) => {
-  const { commentId } = req.params;
-  const { text } = req.body;
+app.put('/api/news/:newsId/comments/:commentId', authenticateToken, async (req, res) => {
+  try {
+    const { commentId } = req.params;
+    const { text } = req.body;
 
-  db.run('UPDATE comments SET text = ? WHERE id = ? AND userId = ?',
-    [text, commentId, req.user.id],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to update comment' });
-      if (this.changes === 0) return res.status(404).json({ error: 'Comment not found or unauthorized' });
+    const result = await pool.query(
+      'UPDATE comments SET text = $1 WHERE id = $2 AND user_id = $3 RETURNING *',
+      [text, commentId, req.user.id]
+    );
 
-      db.get('SELECT * FROM comments WHERE id = ?', [commentId], (err, comment) => {
-        res.json(comment);
-      });
-    });
+    if (result.rows.length === 0) {
+      return res.status(403).json({ error: 'Cannot update others comments' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error updating comment:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Delete comment
-app.delete('/api/news/:newsId/comments/:commentId', authenticateToken, (req, res) => {
-  const { newsId, commentId } = req.params;
+app.delete('/api/news/:newsId/comments/:commentId', authenticateToken, async (req, res) => {
+  try {
+    const { newsId, commentId } = req.params;
 
-  // Check if user is admin
-  db.get('SELECT isAdmin FROM users WHERE id = ?', [req.user.id], (err, user) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    
-    const isAdmin = user && user.isAdmin === 1;
-    const deleteQuery = isAdmin 
-      ? 'DELETE FROM comments WHERE id = ?'
-      : 'DELETE FROM comments WHERE id = ? AND userId = ?';
-    const params = isAdmin ? [commentId] : [commentId, req.user.id];
+    const result = await pool.query(
+      'DELETE FROM comments WHERE id = $1 AND user_id = $2 RETURNING id',
+      [commentId, req.user.id]
+    );
 
-    db.run(deleteQuery, params, function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to delete comment' });
-      if (this.changes === 0) return res.status(404).json({ error: 'Comment not found or unauthorized' });
+    if (result.rows.length === 0) {
+      return res.status(403).json({ error: 'Cannot delete others comments' });
+    }
 
-      db.run('UPDATE news SET comments = comments - 1 WHERE id = ?', [newsId]);
-      res.json({ success: true });
-    });
-  });
+    await pool.query('UPDATE news SET comments = comments - 1 WHERE id = $1', [newsId]);
+    res.json({ message: 'Comment deleted' });
+  } catch (error) {
+    console.error('Error deleting comment:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// ============= CLUBS ROUTES =============
-
 // Get all clubs
-app.get('/api/clubs', authenticateToken, (req, res) => {
-  db.all('SELECT * FROM clubs ORDER BY members DESC', (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: 'Failed to fetch clubs' });
-    }
-    res.json(rows);
-  });
+app.get('/api/clubs', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM clubs ORDER BY name');
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching clubs:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // Create club
-app.post('/api/clubs', authenticateToken, (req, res) => {
-  const {
-    name,
-    category,
-    description,
-    color,
-    instagram,
-    telegram,
-    whatsapp,
-    tiktok,
-    youtube,
-    website,
-    photos,
-    backgroundUrl,
-    backgroundType,
-    clubAvatar
-  } = req.body;
-  const creatorId = req.user.id;
-  const creatorName = req.user?.name || 'Админ';
-  const photoList = JSON.stringify(Array.isArray(photos) ? photos : []);
-  const finalBackgroundType = backgroundType || (backgroundUrl ? 'image' : 'color');
-  const payload = {
-    name,
-    category,
-    description,
-    color: color || 'bg-blue-500',
-    instagram: instagram || '',
-    telegram: telegram || '',
-    whatsapp: whatsapp || '',
-    tiktok: tiktok || '',
-    youtube: youtube || '',
-    website: website || '',
-    creatorId,
-    creatorName,
-    photos: photoList,
-    backgroundUrl: backgroundUrl || '',
-    backgroundType: finalBackgroundType,
-    clubAvatar: clubAvatar || ''
-  };
-  const requiredFields = ['name', 'category', 'description'];
-  const missingFields = requiredFields.filter((field) => !payload[field]?.trim());
-  if (missingFields.length > 0) {
-    console.warn('Club creation missing fields:', missingFields);
+app.post('/api/clubs', authenticateToken, async (req, res) => {
+  try {
+    const { name, category, description } = req.body;
+
+    const userResult = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
+    const creatorName = userResult.rows[0].name;
+
+    const result = await pool.query(
+      `INSERT INTO clubs (name, category, description, creator_id, creator_name, members, photos)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [name, category, description, req.user.id, creatorName, 1, JSON.stringify([])]
+    );
+
+    // Add creator to club
+    await pool.query(
+      'INSERT INTO club_memberships (club_id, user_id, joined_at) VALUES ($1, $2, $3)',
+      [result.rows[0].id, req.user.id, new Date().toISOString()]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating club:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
-
-  const clubColumns = [
-    'name',
-    'category',
-    'members',
-    'description',
-    'color',
-    'instagram',
-    'telegram',
-    'whatsapp',
-    'tiktok',
-    'youtube',
-    'website',
-    'creatorId',
-    'creatorName',
-    'photos',
-    'backgroundUrl',
-    'backgroundType',
-    'clubAvatar'
-  ];
-  const columnValues = [
-    payload.name,
-    payload.category,
-    1,
-    payload.description,
-    payload.color,
-    payload.instagram,
-    payload.telegram,
-    payload.whatsapp,
-    payload.tiktok,
-    payload.youtube,
-    payload.website,
-    payload.creatorId,
-    payload.creatorName,
-    payload.photos,
-    payload.backgroundUrl,
-    payload.backgroundType,
-    payload.clubAvatar
-  ];
-  if (clubColumns.length !== columnValues.length) {
-    console.error('Club insert column/value length mismatch', clubColumns.length, columnValues.length);
-    return res.status(500).json({ error: 'Неправильное количество полей клуба' });
-  }
-
-  db.run(`INSERT INTO clubs (${clubColumns.join(', ')})
-          VALUES (${clubColumns.map(() => '?').join(', ')})`,
-    columnValues,
-    function(err) {
-      if (err) {
-        console.error('Club creation failed:', { error: err.message, payload });
-        return res.status(500).json({ error: err.message || 'Failed to create club' });
-      }
-
-      const clubId = this.lastID;
-      const joinDate = new Date().toISOString();
-      db.run(`INSERT OR IGNORE INTO club_memberships (clubId, userId, joinedAt)
-              VALUES (?, ?, ?)`, [clubId, creatorId, joinDate]);
-
-      db.get('SELECT joinedClubs, joinedProjects FROM users WHERE id = ?', [creatorId], (userErr, userRow) => {
-        if (!userErr && userRow) {
-          let joinedClubs = [];
-          try {
-            joinedClubs = JSON.parse(userRow.joinedClubs || '[]');
-          } catch {
-            joinedClubs = [];
-          }
-          if (!joinedClubs.includes(clubId)) {
-            joinedClubs.push(clubId);
-            db.run('UPDATE users SET joinedClubs = ? WHERE id = ?', [JSON.stringify(joinedClubs), creatorId]);
-          }
-        }
-        db.get('SELECT * FROM clubs WHERE id = ?', [clubId], (selectErr, club) => {
-          if (selectErr) return res.status(500).json({ error: 'Failed to load club' });
-          res.json(club);
-        });
-      });
-    });
 });
 
 // Join club
 app.post('/api/clubs/:id/join', authenticateToken, async (req, res) => {
   try {
-    const clubId = parseInt(req.params.id);
-    if (!clubId || isNaN(clubId)) {
-      return res.status(400).json({ error: 'Invalid club ID' });
+    const { id } = req.params;
+
+    // Check if already member
+    const checkResult = await pool.query(
+      'SELECT * FROM club_memberships WHERE club_id = $1 AND user_id = $2',
+      [id, req.user.id]
+    );
+
+    if (checkResult.rows.length > 0) {
+      return res.status(400).json({ error: 'Already a member' });
     }
 
-    db.get('SELECT * FROM users WHERE id = ?', [req.user.id], (err, user) => {
-      if (err) {
-        console.error('DB Error:', err);
-        return res.status(500).json({ error: 'Database error' });
-      }
-      if (!user) {
-        return res.status(404).json({ error: 'User not found' });
-      }
+    await pool.query(
+      'INSERT INTO club_memberships (club_id, user_id, joined_at) VALUES ($1, $2, $3)',
+      [id, req.user.id, new Date().toISOString()]
+    );
 
-      try {
-        const joinedClubs = JSON.parse(user.joinedClubs || '[]');
-        if (joinedClubs.includes(clubId)) {
-          return res.status(400).json({ error: 'Already joined' });
-        }
-
-        joinedClubs.push(clubId);
-        
-        db.run('UPDATE users SET joinedClubs = ? WHERE id = ?', [JSON.stringify(joinedClubs), req.user.id], (err) => {
-          if (err) {
-            console.error('Update error:', err);
-            return res.status(500).json({ error: 'Failed to join club' });
-          }
-
-          db.run('UPDATE clubs SET members = members + 1 WHERE id = ?', [clubId], (err) => {
-            if (err) {
-              console.error('Club update error:', err);
-              return res.status(500).json({ error: 'Failed to update club' });
-            }
-
-            const joinDate = new Date().toISOString();
-            db.run(`INSERT OR IGNORE INTO club_memberships (clubId, userId, joinedAt)
-                    VALUES (?, ?, ?)`, [clubId, req.user.id, joinDate]);
-
-            res.json({
-              id: user.id,
-              studentId: user.studentId,
-              name: user.name,
-              role: user.role,
-              avatar: user.avatar,
-              isAdmin: user.isAdmin === 1,
-              joinedClubs: joinedClubs,
-              joinedProjects: JSON.parse(user.joinedProjects || '[]')
-            });
-          });
-        });
-      } catch (e) {
-        console.error('Parse error:', e);
-        return res.status(500).json({ error: 'Error processing request' });
-      }
-    });
+    await pool.query('UPDATE clubs SET members = members + 1 WHERE id = $1', [id]);
+    res.json({ message: 'Joined club' });
   } catch (error) {
-    console.error('Catch error:', error);
+    console.error('Error joining club:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 // Leave club
-app.delete('/api/clubs/:id/leave', authenticateToken, (req, res) => {
-  const clubId = parseInt(req.params.id);
-  console.log(`Leave club: clubId=${clubId}, req.params.id=${req.params.id}`);
+app.delete('/api/clubs/:id/leave', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
 
-  db.get('SELECT * FROM users WHERE id = ?', [req.user.id], (err, user) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-
-    let joinedClubs = JSON.parse(user.joinedClubs || '[]');
-    joinedClubs = joinedClubs.filter(id => id !== clubId);
-
-    db.run('UPDATE users SET joinedClubs = ? WHERE id = ?', [JSON.stringify(joinedClubs), req.user.id], (err) => {
-      if (err) return res.status(500).json({ error: 'Failed to leave club' });
-
-      db.run('DELETE FROM club_memberships WHERE clubId = ? AND userId = ?', [clubId, req.user.id]);
-
-      db.run('UPDATE clubs SET members = MAX(0, members - 1) WHERE id = ?', [clubId]);
-
-      res.json({
-        id: user.id,
-        studentId: user.studentId,
-        name: user.name,
-        role: user.role,
-        avatar: user.avatar,
-        isAdmin: user.isAdmin === 1,
-        joinedClubs: joinedClubs,
-        joinedProjects: JSON.parse(user.joinedProjects || '[]')
-      });
-    });
-  });
-});
-
-// Admin: delete club
-app.delete('/api/clubs/:id', authenticateToken, requireAdmin, (req, res) => {
-  const clubId = parseInt(req.params.id);
-  
-  db.run('DELETE FROM clubs WHERE id = ?', [clubId], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to delete club' });
-    if (this.changes === 0) return res.status(404).json({ error: 'Club not found' });
-    res.json({ success: true });
-  });
-});
-
-// Get club detail
-app.get('/api/clubs/:id', authenticateToken, (req, res) => {
-  const clubId = parseInt(req.params.id);
-  if (isNaN(clubId)) {
-    return res.status(400).json({ error: 'Invalid club ID' });
-  }
-
-  db.get('SELECT * FROM clubs WHERE id = ?', [clubId], (err, club) => {
-    if (err) return res.status(500).json({ error: 'Failed to fetch club' });
-    if (!club) return res.status(404).json({ error: 'Club not found' });
-
-    const photos = (() => {
-      try {
-        return JSON.parse(club.photos || '[]');
-      } catch (parseErr) {
-        console.error('Invalid photos JSON for club', clubId, parseErr);
-        return [];
-      }
-    })();
-
-    const buildResponse = (creator) => {
-      db.all('SELECT * FROM activities WHERE club = ? ORDER BY createdAt DESC LIMIT 5', [club.name], (activityErr, activityRows) => {
-        if (activityErr) {
-          return res.status(500).json({ error: 'Failed to fetch activity' });
-        }
-
-        res.json({
-          ...club,
-          photos,
-          creator: creator ? { id: creator.id, name: creator.name, username: creator.studentId, avatar: creator.avatar } : null,
-          socialLinks: {
-            instagram: club.instagram,
-            telegram: club.telegram,
-            whatsapp: club.whatsapp,
-            tiktok: club.tiktok,
-            youtube: club.youtube,
-            website: club.website
-          },
-          recentActivity: activityRows || [],
-          canManageMembers: club.creatorId === req.user.id
-        });
-      });
-    };
-
-    if (club.creatorId) {
-      db.get('SELECT id, name, studentId, avatar FROM users WHERE id = ?', [club.creatorId], (creatorErr, creator) => {
-        if (creatorErr) {
-          console.error('Failed to fetch creator for club', clubId, creatorErr);
-        }
-        buildResponse(creator);
-      });
-    } else {
-      buildResponse(null);
-    }
-  });
-});
-
-// Get club members (creator only)
-app.get('/api/clubs/:id/members', authenticateToken, (req, res) => {
-  const clubId = parseInt(req.params.id);
-  if (isNaN(clubId)) {
-    return res.status(400).json({ error: 'Invalid club ID' });
-  }
-
-  db.get('SELECT creatorId FROM clubs WHERE id = ?', [clubId], (clubErr, club) => {
-    if (clubErr) return res.status(500).json({ error: 'Failed to fetch club' });
-    if (!club) return res.status(404).json({ error: 'Club not found' });
-    if (club.creatorId !== req.user.id) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-
-    db.all(
-      `SELECT u.id, u.name, u.studentId, u.avatar, cm.joinedAt
-       FROM club_memberships cm
-       JOIN users u ON cm.userId = u.id
-       WHERE cm.clubId = ?
-       ORDER BY cm.joinedAt ASC`,
-      [clubId],
-      (membersErr, rows) => {
-        if (membersErr) {
-          return res.status(500).json({ error: 'Failed to fetch members' });
-        }
-        res.json(rows);
-      }
+    const result = await pool.query(
+      'DELETE FROM club_memberships WHERE club_id = $1 AND user_id = $2 RETURNING id',
+      [id, req.user.id]
     );
-  });
-});
 
-// Remove club member (creator only)
-app.delete('/api/clubs/:clubId/members/:memberId', authenticateToken, (req, res) => {
-  const clubId = parseInt(req.params.clubId);
-  const memberId = parseInt(req.params.memberId);
-  if (isNaN(clubId) || isNaN(memberId)) {
-    return res.status(400).json({ error: 'Invalid IDs' });
+    if (result.rows.length === 0) {
+      return res.status(400).json({ error: 'Not a member' });
+    }
+
+    await pool.query('UPDATE clubs SET members = members - 1 WHERE id = $1', [id]);
+    res.json({ message: 'Left club' });
+  } catch (error) {
+    console.error('Error leaving club:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
-
-  db.get('SELECT creatorId FROM clubs WHERE id = ?', [clubId], (clubErr, club) => {
-    if (clubErr) return res.status(500).json({ error: 'Failed to fetch club' });
-    if (!club) return res.status(404).json({ error: 'Club not found' });
-    if (club.creatorId !== req.user.id) {
-      return res.status(403).json({ error: 'Only creator can remove members' });
-    }
-    if (memberId === req.user.id) {
-      return res.status(400).json({ error: 'Creator cannot remove themselves' });
-    }
-
-    db.run('DELETE FROM club_memberships WHERE clubId = ? AND userId = ?', [clubId, memberId], function(deleteErr) {
-      if (deleteErr) return res.status(500).json({ error: 'Failed to remove member' });
-      if (this.changes === 0) return res.status(404).json({ error: 'Member not found' });
-
-      db.get('SELECT joinedClubs FROM users WHERE id = ?', [memberId], (userErr, userRow) => {
-        if (!userErr && userRow) {
-          let joinedClubs = [];
-          try {
-            joinedClubs = JSON.parse(userRow.joinedClubs || '[]');
-          } catch {
-            joinedClubs = [];
-          }
-          const updated = joinedClubs.filter((id) => id !== clubId);
-          db.run('UPDATE users SET joinedClubs = ? WHERE id = ?', [JSON.stringify(updated), memberId]);
-        }
-
-        db.run('UPDATE clubs SET members = MAX(0, members - 1) WHERE id = ?', [clubId], (clubUpdateErr) => {
-          if (clubUpdateErr) {
-            console.error('Failed to decrement club members:', clubUpdateErr);
-          }
-          res.json({ success: true });
-        });
-      });
-    });
-  });
 });
 
-// ============= SCHEDULE ROUTES =============
+// Delete club (admin only)
+app.delete('/api/clubs/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM clubs WHERE id = $1', [id]);
+    res.json({ message: 'Club deleted' });
+  } catch (error) {
+    console.error('Error deleting club:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get club by ID
+app.get('/api/clubs/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query('SELECT * FROM clubs WHERE id = $1', [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Club not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error fetching club:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get club members
+app.get('/api/clubs/:id/members', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      `SELECT u.* FROM users u
+       JOIN club_memberships cm ON u.id = cm.user_id
+       WHERE cm.club_id = $1`,
+      [id]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching club members:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Remove member from club
+app.delete('/api/clubs/:clubId/members/:memberId', authenticateToken, async (req, res) => {
+  try {
+    const { clubId, memberId } = req.params;
+
+    // Check if requester is club creator or admin
+    const clubResult = await pool.query('SELECT creator_id FROM clubs WHERE id = $1', [clubId]);
+    const isCreator = clubResult.rows[0].creator_id === req.user.id;
+
+    if (!isCreator) {
+      const userResult = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
+      if (!userResult.rows[0].is_admin) {
+        return res.status(403).json({ error: 'Not authorized' });
+      }
+    }
+
+    await pool.query(
+      'DELETE FROM club_memberships WHERE club_id = $1 AND user_id = $2',
+      [clubId, memberId]
+    );
+
+    await pool.query('UPDATE clubs SET members = members - 1 WHERE id = $1', [clubId]);
+    res.json({ message: 'Member removed' });
+  } catch (error) {
+    console.error('Error removing member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // Get schedule
-app.get('/api/schedule', authenticateToken, (req, res) => {
-  db.all('SELECT * FROM schedule ORDER BY date, time', (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: 'Failed to fetch schedule' });
-    }
-    res.json(rows);
-  });
-});
-
-// Create schedule item
-app.post('/api/schedule', authenticateToken, (req, res) => {
-  const { date, time, subject, room, type, color } = req.body;
-
-  db.run(`INSERT INTO schedule (date, time, subject, room, type, color)
-          VALUES (?, ?, ?, ?, ?, ?)`,
-    [date, time, subject, room, type || 'lecture', color || 'border-blue-500'],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to create schedule item' });
-
-      db.get('SELECT * FROM schedule WHERE id = ?', [this.lastID], (err, item) => {
-        res.json(item);
-      });
-    });
-});
-
-// Update schedule item
-app.put('/api/schedule/:id', authenticateToken, (req, res) => {
-  const { date, time, subject, room, type, color } = req.body;
-
-  db.run(`UPDATE schedule SET date = ?, time = ?, subject = ?, room = ?, type = ?, color = ?
-          WHERE id = ?`,
-    [date, time, subject, room, type, color, req.params.id],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to update schedule item' });
-
-      db.get('SELECT * FROM schedule WHERE id = ?', [req.params.id], (err, item) => {
-        res.json(item);
-      });
-    });
-});
-
-// Delete schedule item
-app.delete('/api/schedule/:id', authenticateToken, (req, res) => {
-  db.run('DELETE FROM schedule WHERE id = ?', [req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to delete schedule item' });
-    res.json({ success: true });
-  });
-});
-
-// ============= PROJECTS ROUTES =============
-
-// Get all projects
-app.get('/api/projects', authenticateToken, (req, res) => {
-  db.all('SELECT * FROM projects ORDER BY createdAt DESC', (err, rows) => {
-    if (err) {
-      return res.status(500).json({ error: 'Failed to fetch projects' });
-    }
-    
-    const projects = rows.map(row => ({
-      ...row,
-      needed: JSON.parse(row.needed || '[]'),
-      neededKeys: JSON.parse(row.neededKeys || '[]')
-    }));
-    
-    res.json(projects);
-  });
-});
-
-// Create project
-app.post('/api/projects', authenticateToken, (req, res) => {
-  const { title, status, needed, author, clubId, backgroundUrl, description } = req.body;
-
-  db.run(`INSERT INTO projects (title, status, needed, author, clubId, backgroundUrl, description)
-          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    [title, status, JSON.stringify(needed || []), author, clubId || null, backgroundUrl || '', description || ''],
-    function(err) {
-      if (err) return res.status(500).json({ error: 'Failed to create project' });
-
-      db.get('SELECT * FROM projects WHERE id = ?', [this.lastID], (err, project) => {
-        res.json({
-          ...project,
-          needed: JSON.parse(project.needed || '[]')
-        });
-      });
-    });
-});
-
-// Admin: delete project
-app.delete('/api/projects/:id', authenticateToken, requireAdmin, (req, res) => {
-  const projectId = parseInt(req.params.id);
-  
-  db.run('DELETE FROM projects WHERE id = ?', [projectId], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to delete project' });
-    if (this.changes === 0) return res.status(404).json({ error: 'Project not found' });
-    res.json({ success: true });
-  });
-});
-
-// ============= PARLIAMENT ROUTES =============
-
-// Helpers for CRUD logic
-const fetchAllParliamentMembers = () => new Promise((resolve, reject) => {
-  db.all('SELECT * FROM parliament ORDER BY id', (err, rows) => {
-    if (err) return reject(err);
-    resolve(rows);
-  });
-});
-
-const createParliamentMember = ({ name, role, position = '', description = '', groupName = '', avatarUrl }) => new Promise((resolve, reject) => {
-  const normalize = (value) => (value ? value.trim() : '');
-  const cleanedName = normalize(name);
-  const cleanedRole = normalize(role);
-
-  if (!cleanedName || !cleanedRole) {
-    return reject({ status: 400, message: 'Name and role are required' });
-  }
-
-  const [firstName, lastName] = cleanedName.split(/\s+/);
-  const fallbackAvatar = buildAvatar(firstName, lastName);
-
-  db.run('INSERT INTO parliament (name, role, position, description, groupName, avatar, avatarUrl) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [cleanedName, cleanedRole, position || '', description || '', groupName || '', fallbackAvatar, avatarUrl || null], function(err) {
-      if (err) return reject(err);
-      db.get('SELECT * FROM parliament WHERE id = ?', [this.lastID], (selectErr, member) => {
-        if (selectErr) return reject(selectErr);
-        resolve(member);
-      });
-    });
-});
-
-const updateParliamentMember = (memberId, data) => new Promise((resolve, reject) => {
-  const updates = [];
-  const params = [];
-
-  const mapField = (field, column) => {
-    if (Object.prototype.hasOwnProperty.call(data, field)) {
-      updates.push(`${column} = ?`);
-      params.push(data[field]);
-    }
-  };
-
-  mapField('name', 'name');
-  mapField('role', 'role');
-  mapField('position', 'position');
-  mapField('description', 'description');
-  mapField('groupName', 'groupName');
-  mapField('avatarUrl', 'avatarUrl');
-
-  if (!updates.length) {
-    return reject({ status: 400, message: 'No updates provided' });
-  }
-
-  params.push(memberId);
-  db.run(`UPDATE parliament SET ${updates.join(', ')} WHERE id = ?`, params, function(err) {
-    if (err) return reject(err);
-    if (this.changes === 0) return reject({ status: 404, message: 'Member not found' });
-    db.get('SELECT * FROM parliament WHERE id = ?', [memberId], (err, member) => {
-      if (err || !member) return reject({ status: 404, message: 'Member not found' });
-      resolve(member);
-    });
-  });
-});
-
-const deleteParliamentMember = (memberId) => new Promise((resolve, reject) => {
-  db.run('DELETE FROM parliament WHERE id = ?', [memberId], function(err) {
-    if (err) return reject(err);
-    if (this.changes === 0) return reject({ status: 404, message: 'Member not found' });
-    resolve();
-  });
-});
-
-// Public endpoints
-app.get('/api/parliament', authenticateToken, async (_req, res) => {
+app.get('/api/schedule', authenticateToken, async (req, res) => {
   try {
-    const rows = await fetchAllParliamentMembers();
-    res.json(rows);
-  } catch (err) {
-    console.error('Failed to fetch parliament:', err);
-    res.status(500).json({ error: 'Failed to fetch parliament' });
+    const result = await pool.query('SELECT * FROM schedule ORDER BY date, time');
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching schedule:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-app.get('/api/parliament/getAll', authenticateToken, async (_req, res) => {
+// Create schedule entry
+app.post('/api/schedule', authenticateToken, async (req, res) => {
   try {
-    const rows = await fetchAllParliamentMembers();
-    res.json(rows);
-  } catch (err) {
-    console.error('GetAll failed:', err);
-    res.status(500).json({ error: 'Failed to fetch parliament members' });
+    const { date, time, subject, room, type, color } = req.body;
+
+    const result = await pool.query(
+      `INSERT INTO schedule (date, time, subject, room, type, color)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [date, time, subject, room, type, color]
+    );
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error creating schedule:', error);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Admin endpoints
-app.post('/api/parliament', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const member = await createParliamentMember(req.body);
-    res.json(member);
-  } catch (err) {
-    console.error('Failed to add member:', err);
-    const status = err?.status || 500;
-    res.status(status).json({ error: err?.message || 'Failed to add member' });
-  }
-});
-
-app.post('/api/parliament/add', authenticateToken, requireAdmin, async (req, res) => {
-  try {
-    const member = await createParliamentMember(req.body);
-    res.json(member);
-  } catch (err) {
-    console.error('Add failed:', err);
-    const status = err?.status || 500;
-    res.status(status).json({ error: err?.message || 'Failed to add member' });
-  }
-});
-
-app.put('/api/parliament/:id', authenticateToken, requireAdmin, async (req, res) => {
-  const memberId = parseInt(req.params.id, 10);
-  try {
-    const updated = await updateParliamentMember(memberId, req.body);
-    res.json(updated);
-  } catch (err) {
-    console.error('Failed to update member:', err);
-    const status = err?.status || 500;
-    res.status(status).json({ error: err?.message || 'Failed to update member' });
-  }
-});
-
-app.put('/api/parliament/update/:id', authenticateToken, requireAdmin, async (req, res) => {
-  const memberId = parseInt(req.params.id, 10);
-  try {
-    const updated = await updateParliamentMember(memberId, req.body);
-    res.json(updated);
-  } catch (err) {
-    console.error('Update failed:', err);
-    const status = err?.status || 500;
-    res.status(status).json({ error: err?.message || 'Failed to update member' });
-  }
-});
-
-app.put('/api/parliament/:id/avatar', authenticateToken, requireAdmin, (req, res) => {
-  const { avatarUrl } = req.body;
-
-  db.run('UPDATE parliament SET avatarUrl = ? WHERE id = ?', [avatarUrl, req.params.id], function(err) {
-    if (err) return res.status(500).json({ error: 'Failed to update avatar' });
-
-    db.get('SELECT * FROM parliament WHERE id = ?', [req.params.id], (err, member) => {
-      res.json(member);
-    });
-  });
-});
-
-app.delete('/api/parliament/:id', authenticateToken, requireAdmin, async (req, res) => {
-  const memberId = parseInt(req.params.id, 10);
-  try {
-    await deleteParliamentMember(memberId);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Failed to delete member:', err);
-    const status = err?.status || 500;
-    res.status(status).json({ error: err?.message || 'Failed to delete member' });
-  }
-});
-
-app.delete('/api/parliament/remove/:id', authenticateToken, requireAdmin, async (req, res) => {
-  const memberId = parseInt(req.params.id, 10);
-  try {
-    await deleteParliamentMember(memberId);
-    res.json({ success: true });
-  } catch (err) {
-    console.error('Remove failed:', err);
-    const status = err?.status || 500;
-    res.status(status).json({ error: err?.message || 'Failed to remove member' });
-  }
-});
-
-// ============= ACTIVITIES ROUTES =============
-
-// Get user activities
-app.get('/api/activities', authenticateToken, (req, res) => {
-  db.all('SELECT * FROM activities WHERE userId = ? ORDER BY createdAt DESC LIMIT 20', 
-    [req.user.id], 
-    (err, rows) => {
-      if (err) {
-        return res.status(500).json({ error: 'Failed to fetch activities' });
-      }
-      res.json(rows);
-    });
-});
-
-// Feedback accept endpoint - sends email to user
-app.post('/api/feedback/accept', authenticateToken, requireAdmin, async (req, res) => {
-  const { email, name, subject } = req.body;
-
-  try {
-    // Email content
-    const emailContent = {
-      from: '"College Hub Support" <noreply@collegehub.com>',
-      to: email,
-      subject: `✓ Ваше обращение принято - ${subject}`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-          <div style="background: linear-gradient(135deg, #0284c7 0%, #0ea5e9 100%); color: white; padding: 20px; border-radius: 10px; text-align: center; margin-bottom: 20px;">
-            <h2 style="margin: 0; font-size: 24px;">✓ Спасибо!</h2>
-          </div>
-          
-          <p>Здравствуйте, <strong>${name}</strong>!</p>
-          
-          <p>Ваше обращение с темой <strong>"${subject}"</strong> успешно принято нашей командой.</p>
-          
-          <div style="background: #f0f9ff; border-left: 4px solid #0284c7; padding: 15px; margin: 20px 0; border-radius: 5px;">
-            <p style="margin: 0; color: #0284c7;">
-              <strong>Статус:</strong> В обработке
-            </p>
-            <p style="margin: 5px 0 0 0; color: #666; font-size: 14px;">
-              Мы проанализируем ваше сообщение и свяжемся с вами в ближайшее время.
-            </p>
-          </div>
-          
-          <p style="color: #666; font-size: 14px; margin-top: 20px;">
-            Если вы хотите добавить информацию к вашему обращению, просто ответьте на это письмо.
-          </p>
-          
-          <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 20px 0;">
-          
-          <p style="color: #999; font-size: 12px; text-align: center;">
-            College Hub Support Team<br>
-            © 2025 College Hub. Все права защищены.
-          </p>
-        </div>
-      `
-    };
-
-    // Send email if transporter is available
-    if (emailTransporter) {
-      const info = await emailTransporter.sendMail(emailContent);
-      console.log('✅ Email sent successfully!');
-      console.log('   To:', email);
-      console.log('   Subject:', emailContent.subject);
-      
-      // If using Ethereal test account, show the preview URL
-      if (process.env.NODE_ENV !== 'production' && !hasGmailConfig) {
-        const testUrl = nodemailer.getTestMessageUrl(info);
-        if (testUrl) {
-          console.log('   📧 Preview URL:', testUrl);
-          res.json({ 
-            success: true, 
-            message: 'Email sent successfully',
-            previewUrl: testUrl 
-          });
-          return;
-        }
-      }
-      
-      res.json({ success: true, message: 'Email sent successfully' });
-    } else {
-      // Fallback if transporter not ready yet
-      console.log('📧 [DEV MODE] Email would be sent to:', email);
-      console.log('   Subject:', emailContent.subject);
-      console.log('   To:', name);
-      res.json({ success: true, message: 'Feedback received (email not sent - transporter not ready)' });
-    }
-  } catch (err) {
-    console.error('Failed to process feedback:', err);
-    res.status(500).json({ error: 'Failed to process feedback: ' + err.message });
-  }
-});
-
-// Global error handler
-app.use((err, req, res, _next) => {
-  void _next;
+// Error handling
+app.use((err, req, res, next) => {
+  void next;
   console.error('Express error:', err);
   res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
 });
@@ -1643,16 +974,11 @@ if (process.env.NODE_ENV !== 'production') {
 
   server.on('error', (err) => {
     console.error('Express failed to bind to port:', err.code || err.message);
-    console.error('Verify that nothing else is using the port and try again.');
     process.exit(1);
   });
 
-  // Graceful shutdown
   process.on('SIGINT', () => {
-    db.close((err) => {
-      if (err) {
-        console.error('Error closing database:', err.message);
-      }
+    pool.end(() => {
       console.log('Database connection closed');
       process.exit(0);
     });
