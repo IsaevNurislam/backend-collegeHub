@@ -8,8 +8,6 @@
     }
   },
   "env": {
-    "NODE_ENV": "production",
-    "GMAIL_USER": "@gmail_user",
-    "GMAIL_APP_PASSWORD": "@gmail_app_password"
+    "NODE_ENV": "production"
   }
 }
