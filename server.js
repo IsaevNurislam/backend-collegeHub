@@ -310,6 +310,7 @@ async function initializeDatabase() {
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(100)`).catch(() => {});
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500)`).catch(() => {});
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name_change TIMESTAMP`).catch(() => {});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name_change_date TEXT`).catch(() => {});
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS news (
@@ -792,120 +793,95 @@ app.post('/api/auth/login', async (req, res) => {
 app.get('/api/user/me', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
-    const user = result.rows[0];
-
-    if (!user) {
+    
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
 
+    const user = result.rows[0];
     res.json({
       id: user.id,
       student_id: user.student_id,
-      name: user.name,
       first_name: user.first_name,
       last_name: user.last_name,
+      name: user.name,
       role: user.role,
-      is_admin: user.is_admin,
       avatar: user.avatar,
       avatar_url: user.avatar_url,
+      last_name_change_date: user.last_name_change_date,
+      is_admin: user.is_admin,
       joined_clubs: safeJsonParse(user.joined_clubs, []),
-      joined_projects: safeJsonParse(user.joined_projects, []),
-      last_name_change: user.last_name_change
+      joined_projects: safeJsonParse(user.joined_projects, [])
     });
-  } catch (error) {
-    console.error('Error fetching user:', error);
-    res.status(500).json({ error: 'Internal server error' });
+  } catch (err) {
+    console.error('Get user error:', err);
+    res.status(500).json({ error: 'Failed to get user' });
   }
 });
 
 // Update user profile
 app.put('/api/user/profile', authenticateToken, async (req, res) => {
   try {
-    const { firstName, lastName, name, role, avatarUrl } = req.body;
+    const { firstName, lastName, name, role, avatarUrl, lastNameChangeDate } = req.body;
     
-    // Support both new format (firstName, lastName) and old format (name)
-    let newFirstName = firstName ? sanitizeNameInput(firstName) : null;
-    let newLastName = lastName ? sanitizeNameInput(lastName) : null;
-    let newName = name;
-    
-    if (newFirstName && newLastName) {
-      newName = `${newFirstName} ${newLastName}`;
-    } else if (name) {
-      // Parse name into first/last if only name provided
-      const parts = name.trim().split(' ');
-      newFirstName = sanitizeNameInput(parts[0] || '');
-      newLastName = sanitizeNameInput(parts.slice(1).join(' ') || '');
+    // Build display name
+    let displayName = name;
+    if (!displayName && (firstName || lastName)) {
+      displayName = `${firstName || ''} ${lastName || ''}`.trim();
     }
     
-    const cleanedName = sanitizeNameInput(newName);
-
-    if (!cleanedName) {
-      return res.status(400).json({ error: 'Name is required' });
+    // Avatar can be URL or initials
+    let avatar = avatarUrl;
+    if (!avatar && displayName) {
+      const parts = displayName.split(' ');
+      avatar = `${parts[0]?.[0] || ''}${parts[1]?.[0] || 'S'}`.toUpperCase();
     }
 
-    // Get current user data
-    const userResult = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
-    const user = userResult.rows[0];
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
     
-    if (!user) {
+    if (firstName !== undefined) { updates.push(`first_name = $${paramIndex++}`); values.push(firstName); }
+    if (lastName !== undefined) { updates.push(`last_name = $${paramIndex++}`); values.push(lastName); }
+    if (displayName) { updates.push(`name = $${paramIndex++}`); values.push(displayName); }
+    if (role !== undefined) { updates.push(`role = $${paramIndex++}`); values.push(role); }
+    if (avatar) { updates.push(`avatar = $${paramIndex++}`); values.push(avatar); }
+    if (avatarUrl !== undefined) { updates.push(`avatar_url = $${paramIndex++}`); values.push(avatarUrl); }
+    if (lastNameChangeDate) { updates.push(`last_name_change_date = $${paramIndex++}`); values.push(lastNameChangeDate); }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    values.push(req.user.id);
+
+    const result = await pool.query(
+      `UPDATE users SET ${updates.join(', ')} WHERE id = $${paramIndex} RETURNING *`,
+      values
+    );
+
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Check if name is being changed
-    const isNameChanged = user.name !== cleanedName;
-    
-    if (isNameChanged) {
-      // Check 7-day cooldown for name change
-      if (user.last_name_change) {
-        const lastChange = new Date(user.last_name_change);
-        const now = new Date();
-        const daysSinceChange = (now - lastChange) / (1000 * 60 * 60 * 24);
-        
-        if (daysSinceChange < 7) {
-          const daysLeft = Math.ceil(7 - daysSinceChange);
-          return res.status(400).json({ 
-            error: `You can change your name again in ${daysLeft} day(s)`,
-            days_left: daysLeft
-          });
-        }
-      }
-    }
-
-    // Build avatar from name (initials)
-    const avatar = buildAvatar(newFirstName, newLastName);
-
-    // Update user
-    const updateResult = await pool.query(
-      `UPDATE users SET 
-        name = $1, 
-        first_name = $2,
-        last_name = $3,
-        avatar = $4,
-        avatar_url = COALESCE($5, avatar_url),
-        role = COALESCE($6, role),
-        last_name_change = CASE WHEN $7 THEN NOW() ELSE last_name_change END
-       WHERE id = $8 RETURNING *`,
-      [cleanedName, newFirstName, newLastName, avatar, avatarUrl || null, role || null, isNameChanged, req.user.id]
-    );
-
-    const updatedUser = updateResult.rows[0];
-
-    // Return in snake_case for compatibility
+    const user = result.rows[0];
     res.json({
-      id: updatedUser.id,
-      student_id: updatedUser.student_id,
-      name: updatedUser.name,
-      first_name: updatedUser.first_name,
-      last_name: updatedUser.last_name,
-      role: updatedUser.role,
-      avatar: updatedUser.avatar,
-      avatar_url: updatedUser.avatar_url,
-      is_admin: updatedUser.is_admin,
-      last_name_change: updatedUser.last_name_change
+      id: user.id,
+      student_id: user.student_id,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      name: user.name,
+      role: user.role,
+      avatar: user.avatar,
+      avatar_url: user.avatar_url,
+      last_name_change_date: user.last_name_change_date,
+      is_admin: user.is_admin,
+      joined_clubs: safeJsonParse(user.joined_clubs, []),
+      joined_projects: safeJsonParse(user.joined_projects, [])
     });
-  } catch (error) {
-    console.error('Error updating profile:', error);
-    res.status(500).json({ error: 'Internal server error', details: error.message });
+  } catch (err) {
+    console.error('Profile update error:', err);
+    res.status(500).json({ error: 'Failed to update profile' });
   }
 });
 
