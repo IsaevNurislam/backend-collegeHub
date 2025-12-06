@@ -621,7 +621,7 @@ async function seedDatabase() {
 // Login route
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { studentId, password, firstName, lastName } = req.body;
+    const { studentId, password, firstName, lastName, isRegistration } = req.body;
     const cleanedFirstName = sanitizeNameInput(firstName);
     const cleanedLastName = sanitizeNameInput(lastName);
 
@@ -644,18 +644,29 @@ app.post('/api/auth/login', async (req, res) => {
     if (studentId === ADMIN_ID && password === ADMIN_PASSWORD) {
       console.log('[Auth] ⚡ Admin bypass - password matches hardcoded secret');
       
-      // Update password in PostgreSQL and ensure admin status
-      await pool.query(
-        'UPDATE users SET password = $1, is_admin = true WHERE student_id = $2',
-        [bcrypt.hashSync(ADMIN_PASSWORD, 10), ADMIN_ID]
-      );
+      // Create admin if doesn't exist
+      if (!user) {
+        const hashedPassword = bcrypt.hashSync(ADMIN_PASSWORD, 10);
+        const createResult = await pool.query(
+          `INSERT INTO users (student_id, name, role, avatar, password, is_admin, joined_clubs, joined_projects)
+           VALUES ($1, $2, $3, $4, $5, true, '[]', '[]') RETURNING *`,
+          [ADMIN_ID, 'Админ Колледжа', 'Администратор', 'АК', hashedPassword]
+        );
+        user = createResult.rows[0];
+      } else {
+        // Update password in PostgreSQL and ensure admin status
+        await pool.query(
+          'UPDATE users SET password = $1, is_admin = true WHERE student_id = $2',
+          [bcrypt.hashSync(ADMIN_PASSWORD, 10), ADMIN_ID]
+        );
+      }
       
-      const token = jwt.sign({ id: user?.id || 1, studentId: ADMIN_ID, name: 'Админ Колледжа' }, JWT_SECRET, { expiresIn: '7d' });
+      const token = jwt.sign({ id: user.id, studentId: ADMIN_ID, name: 'Админ Колледжа' }, JWT_SECRET, { expiresIn: '7d' });
       
       return res.json({
         token,
         user: {
-          id: user?.id || 1,
+          id: user.id,
           studentId: ADMIN_ID,
           name: 'Админ Колледжа',
           role: 'Администратор',
@@ -667,18 +678,23 @@ app.post('/api/auth/login', async (req, res) => {
       });
     }
 
-    if (user) {
-      // User exists - verify password
-      const passwordMatch = bcrypt.compareSync(password, user.password);
-      if (!passwordMatch) {
-        return res.status(401).json({ error: 'Invalid credentials' });
+    // REGISTRATION MODE
+    if (isRegistration) {
+      // Check if user already exists
+      if (user) {
+        return res.status(409).json({ error: 'User with this Student ID already exists. Please login instead.' });
       }
-    } else {
-      // New user - create account
+      
+      // Validate required fields for registration
       if (!cleanedFirstName || !cleanedLastName) {
-        return res.status(400).json({ error: 'First name and last name required for new users' });
+        return res.status(400).json({ error: 'First name and last name are required for registration' });
+      }
+      
+      if (password.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
       }
 
+      // Create new user
       const hashedPassword = bcrypt.hashSync(password, 10);
       const avatar = buildAvatar(cleanedFirstName, cleanedLastName);
       const fullName = `${cleanedFirstName} ${cleanedLastName}`;
@@ -689,6 +705,23 @@ app.post('/api/auth/login', async (req, res) => {
         [studentId, fullName, 'Студент', avatar, hashedPassword, '[]', '[]']
       );
       user = createResult.rows[0];
+      
+      console.log('[Auth] ✅ New user registered:', studentId);
+    } 
+    // LOGIN MODE
+    else {
+      // User must exist for login
+      if (!user) {
+        return res.status(404).json({ error: 'User not found. Please register first.' });
+      }
+      
+      // Verify password
+      const passwordMatch = bcrypt.compareSync(password, user.password);
+      if (!passwordMatch) {
+        return res.status(401).json({ error: 'Invalid password' });
+      }
+      
+      console.log('[Auth] ✅ User logged in:', studentId);
     }
 
     // Generate JWT token
@@ -706,7 +739,9 @@ app.post('/api/auth/login', async (req, res) => {
         name: user.name,
         role: user.role,
         isAdmin: user.is_admin,
-        avatar: user.avatar
+        avatar: user.avatar,
+        joinedClubs: safeJsonParse(user.joined_clubs, []),
+        joinedProjects: safeJsonParse(user.joined_projects, [])
       }
     });
   } catch (error) {
