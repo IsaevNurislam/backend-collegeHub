@@ -1139,6 +1139,19 @@ app.delete('/api/clubs/:clubId/members/:memberId', authenticateToken, async (req
   }
 });
 
+// Helper function to safely parse JSON
+const safeJsonParse = (value, defaultValue = []) => {
+  if (!value) return defaultValue;
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string') return defaultValue;
+  try {
+    return JSON.parse(value);
+  } catch (e) {
+    console.warn('Failed to parse JSON:', value);
+    return defaultValue;
+  }
+};
+
 // Get all projects
 app.get('/api/projects', authenticateToken, async (req, res) => {
   try {
@@ -1146,8 +1159,8 @@ app.get('/api/projects', authenticateToken, async (req, res) => {
     
     const projects = result.rows.map(row => ({
       ...row,
-      needed: typeof row.needed === 'string' ? JSON.parse(row.needed) : (row.needed || []),
-      needed_keys: typeof row.needed_keys === 'string' ? JSON.parse(row.needed_keys) : (row.needed_keys || [])
+      needed: safeJsonParse(row.needed, []),
+      needed_keys: safeJsonParse(row.needed_keys, [])
     }));
     
     res.json(projects);
