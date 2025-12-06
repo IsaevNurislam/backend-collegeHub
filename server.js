@@ -1143,7 +1143,14 @@ app.delete('/api/clubs/:clubId/members/:memberId', authenticateToken, async (req
 app.get('/api/projects', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM projects ORDER BY created_at DESC');
-    res.json(result.rows);
+    
+    const projects = result.rows.map(row => ({
+      ...row,
+      needed: typeof row.needed === 'string' ? JSON.parse(row.needed) : (row.needed || []),
+      needed_keys: typeof row.needed_keys === 'string' ? JSON.parse(row.needed_keys) : (row.needed_keys || [])
+    }));
+    
+    res.json(projects);
   } catch (error) {
     console.error('Error fetching projects:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -1153,18 +1160,30 @@ app.get('/api/projects', authenticateToken, async (req, res) => {
 // Create project
 app.post('/api/projects', authenticateToken, async (req, res) => {
   try {
-    const { title, status, needed, author, description } = req.body;
+    const { title, status, needed, author, description, background_url, club_id } = req.body;
 
     const result = await pool.query(
-      `INSERT INTO projects (title, status, needed, author, description, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [title, status, needed, author, description, new Date().toISOString()]
+      `INSERT INTO projects (title, status, needed, author, description, background_url, club_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NOW()) RETURNING *`,
+      [
+        title, 
+        status, 
+        JSON.stringify(needed || []), 
+        author, 
+        description || null, 
+        background_url || null,
+        club_id || null
+      ]
     );
 
-    res.json(result.rows[0]);
+    const row = result.rows[0];
+    res.json({
+      ...row,
+      needed: typeof row.needed === 'string' ? JSON.parse(row.needed) : (row.needed || [])
+    });
   } catch (error) {
     console.error('Error creating project:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Failed to create project', details: error.message });
   }
 });
 
