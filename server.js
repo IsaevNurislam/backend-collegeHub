@@ -649,8 +649,8 @@ async function seedDatabase() {
 
 // ============ ROUTES ============
 
-// Login route
-app.post('/api/auth/login', async (req, res) => {
+// Login route handler
+const loginHandler = async (req, res) => {
   try {
     const { studentId, password, firstName, lastName, isRegistration } = req.body;
     const cleanedFirstName = sanitizeNameInput(firstName);
@@ -787,7 +787,11 @@ app.post('/api/auth/login', async (req, res) => {
     console.error('Login error:', error);
     res.status(500).json({ error: error.message });
   }
-});
+};
+
+// Register login handler on both paths for compatibility
+app.post('/api/auth/login', loginHandler);
+app.post('/api/login', loginHandler);
 
 // Get current user
 app.get('/api/user/me', authenticateToken, async (req, res) => {
