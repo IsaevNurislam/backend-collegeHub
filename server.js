@@ -291,9 +291,12 @@ async function initializeDatabase() {
         id SERIAL PRIMARY KEY,
         student_id VARCHAR(6) UNIQUE NOT NULL,
         name VARCHAR(255) NOT NULL,
+        first_name VARCHAR(100),
+        last_name VARCHAR(100),
         role VARCHAR(255),
         is_admin BOOLEAN DEFAULT FALSE,
         avatar VARCHAR(255),
+        avatar_url VARCHAR(500),
         password VARCHAR(255) NOT NULL,
         joined_clubs TEXT DEFAULT '[]',
         joined_projects TEXT DEFAULT '[]',
@@ -302,10 +305,11 @@ async function initializeDatabase() {
       )
     `);
     
-    // Add last_name_change column if it doesn't exist
-    await pool.query(`
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name_change TIMESTAMP
-    `).catch(() => {});
+    // Add new columns if they don't exist
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(100)`).catch(() => {});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(100)`).catch(() => {});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(500)`).catch(() => {});
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name_change TIMESTAMP`).catch(() => {});
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS news (
@@ -693,13 +697,17 @@ app.post('/api/auth/login', async (req, res) => {
         token,
         user: {
           id: user.id,
-          studentId: ADMIN_ID,
+          student_id: ADMIN_ID,
           name: 'Админ Колледжа',
+          first_name: 'Админ',
+          last_name: 'Колледжа',
           role: 'Администратор',
           avatar: 'АК',
-          isAdmin: true,
-          joinedClubs: [],
-          joinedProjects: []
+          avatar_url: null,
+          is_admin: true,
+          joined_clubs: [],
+          joined_projects: [],
+          last_name_change: null
         }
       });
     }
@@ -726,9 +734,9 @@ app.post('/api/auth/login', async (req, res) => {
       const fullName = `${cleanedFirstName} ${cleanedLastName}`;
 
       const createResult = await pool.query(
-        `INSERT INTO users (student_id, name, role, avatar, password, joined_clubs, joined_projects)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-        [studentId, fullName, 'Студент', avatar, hashedPassword, '[]', '[]']
+        `INSERT INTO users (student_id, name, first_name, last_name, role, avatar, password, joined_clubs, joined_projects)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+        [studentId, fullName, cleanedFirstName, cleanedLastName, 'Студент', avatar, hashedPassword, '[]', '[]']
       );
       user = createResult.rows[0];
       
@@ -761,13 +769,17 @@ app.post('/api/auth/login', async (req, res) => {
       token,
       user: {
         id: user.id,
-        studentId: user.student_id,
+        student_id: user.student_id,
         name: user.name,
+        first_name: user.first_name,
+        last_name: user.last_name,
         role: user.role,
-        isAdmin: user.is_admin,
+        is_admin: user.is_admin,
         avatar: user.avatar,
-        joinedClubs: safeJsonParse(user.joined_clubs, []),
-        joinedProjects: safeJsonParse(user.joined_projects, [])
+        avatar_url: user.avatar_url,
+        joined_clubs: safeJsonParse(user.joined_clubs, []),
+        joined_projects: safeJsonParse(user.joined_projects, []),
+        last_name_change: user.last_name_change
       }
     });
   } catch (error) {
@@ -788,11 +800,17 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
 
     res.json({
       id: user.id,
-      studentId: user.student_id,
+      student_id: user.student_id,
       name: user.name,
+      first_name: user.first_name,
+      last_name: user.last_name,
       role: user.role,
-      isAdmin: user.is_admin,
-      avatar: user.avatar
+      is_admin: user.is_admin,
+      avatar: user.avatar,
+      avatar_url: user.avatar_url,
+      joined_clubs: safeJsonParse(user.joined_clubs, []),
+      joined_projects: safeJsonParse(user.joined_projects, []),
+      last_name_change: user.last_name_change
     });
   } catch (error) {
     console.error('Error fetching user:', error);
@@ -803,12 +821,20 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
 // Update user profile
 app.put('/api/user/profile', authenticateToken, async (req, res) => {
   try {
-    const { firstName, lastName, name, role } = req.body;
+    const { firstName, lastName, name, role, avatarUrl } = req.body;
     
     // Support both new format (firstName, lastName) and old format (name)
+    let newFirstName = firstName ? sanitizeNameInput(firstName) : null;
+    let newLastName = lastName ? sanitizeNameInput(lastName) : null;
     let newName = name;
-    if (firstName && lastName) {
-      newName = `${sanitizeNameInput(firstName)} ${sanitizeNameInput(lastName)}`;
+    
+    if (newFirstName && newLastName) {
+      newName = `${newFirstName} ${newLastName}`;
+    } else if (name) {
+      // Parse name into first/last if only name provided
+      const parts = name.trim().split(' ');
+      newFirstName = sanitizeNameInput(parts[0] || '');
+      newLastName = sanitizeNameInput(parts.slice(1).join(' ') || '');
     }
     
     const cleanedName = sanitizeNameInput(newName);
@@ -839,37 +865,43 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
           const daysLeft = Math.ceil(7 - daysSinceChange);
           return res.status(400).json({ 
             error: `You can change your name again in ${daysLeft} day(s)`,
-            daysLeft: daysLeft
+            days_left: daysLeft
           });
         }
       }
     }
 
-    // Build avatar from name
-    const nameParts = cleanedName.split(' ');
-    const avatar = `${(nameParts[0]?.[0] || 'U')}${(nameParts[1]?.[0] || '')}`.toUpperCase();
+    // Build avatar from name (initials)
+    const avatar = buildAvatar(newFirstName, newLastName);
 
     // Update user
     const updateResult = await pool.query(
       `UPDATE users SET 
         name = $1, 
-        avatar = $2,
-        role = COALESCE($3, role),
-        last_name_change = CASE WHEN $4 THEN NOW() ELSE last_name_change END
-       WHERE id = $5 RETURNING *`,
-      [cleanedName, avatar, role || null, isNameChanged, req.user.id]
+        first_name = $2,
+        last_name = $3,
+        avatar = $4,
+        avatar_url = COALESCE($5, avatar_url),
+        role = COALESCE($6, role),
+        last_name_change = CASE WHEN $7 THEN NOW() ELSE last_name_change END
+       WHERE id = $8 RETURNING *`,
+      [cleanedName, newFirstName, newLastName, avatar, avatarUrl || null, role || null, isNameChanged, req.user.id]
     );
 
     const updatedUser = updateResult.rows[0];
 
+    // Return in snake_case for compatibility
     res.json({
       id: updatedUser.id,
-      studentId: updatedUser.student_id,
+      student_id: updatedUser.student_id,
       name: updatedUser.name,
+      first_name: updatedUser.first_name,
+      last_name: updatedUser.last_name,
       role: updatedUser.role,
       avatar: updatedUser.avatar,
-      isAdmin: updatedUser.is_admin,
-      lastNameChange: updatedUser.last_name_change
+      avatar_url: updatedUser.avatar_url,
+      is_admin: updatedUser.is_admin,
+      last_name_change: updatedUser.last_name_change
     });
   } catch (error) {
     console.error('Error updating profile:', error);
