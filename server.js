@@ -297,9 +297,15 @@ async function initializeDatabase() {
         password VARCHAR(255) NOT NULL,
         joined_clubs TEXT DEFAULT '[]',
         joined_projects TEXT DEFAULT '[]',
+        last_name_change TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+    
+    // Add last_name_change column if it doesn't exist
+    await pool.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name_change TIMESTAMP
+    `).catch(() => {});
 
     await pool.query(`
       CREATE TABLE IF NOT EXISTS news (
@@ -725,26 +731,77 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
 // Update user profile
 app.put('/api/user/profile', authenticateToken, async (req, res) => {
   try {
-    const { name, role } = req.body;
-    const cleanedName = sanitizeNameInput(name);
+    const { firstName, lastName, name, role } = req.body;
+    
+    // Support both new format (firstName, lastName) and old format (name)
+    let newName = name;
+    if (firstName && lastName) {
+      newName = `${sanitizeNameInput(firstName)} ${sanitizeNameInput(lastName)}`;
+    }
+    
+    const cleanedName = sanitizeNameInput(newName);
 
-    if (!cleanedName || !role) {
-      return res.status(400).json({ error: 'Name and role required' });
+    if (!cleanedName) {
+      return res.status(400).json({ error: 'Name is required' });
     }
 
-    const result = await pool.query(
-      'UPDATE users SET name = $1, role = $2 WHERE id = $3 RETURNING *',
-      [cleanedName, role, req.user.id]
+    // Get current user data
+    const userResult = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    const user = userResult.rows[0];
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Check if name is being changed
+    const isNameChanged = user.name !== cleanedName;
+    
+    if (isNameChanged) {
+      // Check 7-day cooldown for name change
+      if (user.last_name_change) {
+        const lastChange = new Date(user.last_name_change);
+        const now = new Date();
+        const daysSinceChange = (now - lastChange) / (1000 * 60 * 60 * 24);
+        
+        if (daysSinceChange < 7) {
+          const daysLeft = Math.ceil(7 - daysSinceChange);
+          return res.status(400).json({ 
+            error: `You can change your name again in ${daysLeft} day(s)`,
+            daysLeft: daysLeft
+          });
+        }
+      }
+    }
+
+    // Build avatar from name
+    const nameParts = cleanedName.split(' ');
+    const avatar = `${(nameParts[0]?.[0] || 'U')}${(nameParts[1]?.[0] || '')}`.toUpperCase();
+
+    // Update user
+    const updateResult = await pool.query(
+      `UPDATE users SET 
+        name = $1, 
+        avatar = $2,
+        role = COALESCE($3, role),
+        last_name_change = CASE WHEN $4 THEN NOW() ELSE last_name_change END
+       WHERE id = $5 RETURNING *`,
+      [cleanedName, avatar, role || null, isNameChanged, req.user.id]
     );
 
+    const updatedUser = updateResult.rows[0];
+
     res.json({
-      id: result.rows[0].id,
-      name: result.rows[0].name,
-      role: result.rows[0].role
+      id: updatedUser.id,
+      studentId: updatedUser.student_id,
+      name: updatedUser.name,
+      role: updatedUser.role,
+      avatar: updatedUser.avatar,
+      isAdmin: updatedUser.is_admin,
+      lastNameChange: updatedUser.last_name_change
     });
   } catch (error) {
     console.error('Error updating profile:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 });
 
