@@ -1461,24 +1461,33 @@ app.post('/api/schedule', authenticateToken, async (req, res) => {
 // Get all chat messages
 app.get('/api/chat/messages', authenticateToken, async (req, res) => {
   try {
+    const currentUserId = req.user.id;
+    
     const result = await pool.query(
-      `SELECT m.*, 
-              r.id as reply_id, r.user_name as reply_user_name, r.text as reply_text
+      `SELECT 
+        m.id, m.text, m.created_at, m.reply_to_id,
+        u.id as user_id, u.name as author, u.avatar, u.student_id,
+        (m.user_id = $1) as is_mine,
+        r.id as reply_id, r.user_name as reply_user_name, r.text as reply_text
        FROM chat_messages m
+       JOIN users u ON m.user_id = u.id
        LEFT JOIN chat_messages r ON m.reply_to_id = r.id
-       ORDER BY m.created_at ASC LIMIT 500`
+       ORDER BY m.created_at ASC LIMIT 500`,
+      [currentUserId]
     );
     
     const messages = result.rows.map(row => ({
       id: row.id,
-      userId: row.user_id,
-      userName: row.user_name,
-      userAvatar: row.user_avatar,
       text: row.text,
-      createdAt: row.created_at,
-      replyTo: row.reply_id ? {
+      user_id: row.user_id,
+      author: row.author,
+      avatar: row.avatar,
+      student_id: row.student_id,
+      created_at: row.created_at,
+      is_mine: row.is_mine,
+      reply_to: row.reply_id ? {
         id: row.reply_id,
-        userName: row.reply_user_name,
+        author: row.reply_user_name,
         text: row.reply_text
       } : null
     }));
@@ -1501,7 +1510,7 @@ app.post('/api/chat/messages', authenticateToken, async (req, res) => {
 
     // Get user info
     const userResult = await pool.query(
-      'SELECT name, avatar FROM users WHERE id = $1',
+      'SELECT id, name, avatar, student_id FROM users WHERE id = $1',
       [req.user.id]
     );
     
@@ -1528,18 +1537,20 @@ app.post('/api/chat/messages', authenticateToken, async (req, res) => {
       );
       if (replyResult.rows.length > 0) {
         const r = replyResult.rows[0];
-        replyTo = { id: r.id, userName: r.user_name, text: r.text };
+        replyTo = { id: r.id, author: r.user_name, text: r.text };
       }
     }
     
     res.json({
       id: row.id,
-      userId: row.user_id,
-      userName: row.user_name,
-      userAvatar: row.user_avatar,
       text: row.text,
-      createdAt: row.created_at,
-      replyTo: replyTo
+      user_id: user.id,
+      author: user.name,
+      avatar: user.avatar,
+      student_id: user.student_id,
+      created_at: row.created_at,
+      is_mine: true,
+      reply_to: replyTo
     });
   } catch (error) {
     console.error('Error sending chat message:', error);
