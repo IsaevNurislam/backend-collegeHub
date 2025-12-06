@@ -961,15 +961,31 @@ app.get('/api/clubs', authenticateToken, async (req, res) => {
 // Create club
 app.post('/api/clubs', authenticateToken, async (req, res) => {
   try {
-    const { name, category, description } = req.body;
+    const { 
+      name, category, description, color,
+      club_avatar, background_url, background_type,
+      instagram, telegram, tiktok, youtube, website, whatsapp,
+      photos
+    } = req.body;
 
     const userResult = await pool.query('SELECT name FROM users WHERE id = $1', [req.user.id]);
     const creatorName = userResult.rows[0].name;
 
     const result = await pool.query(
-      `INSERT INTO clubs (name, category, description, creator_id, creator_name, members, photos)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-      [name, category, description, req.user.id, creatorName, 1, JSON.stringify([])]
+      `INSERT INTO clubs (
+        name, category, description, color,
+        club_avatar, background_url, background_type,
+        instagram, telegram, tiktok, youtube, website, whatsapp,
+        creator_id, creator_name, members, photos, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 1, $16, NOW())
+      RETURNING *`,
+      [
+        name, category, description, color || 'bg-blue-500',
+        club_avatar || null, background_url || null, background_type || 'color',
+        instagram || null, telegram || null, tiktok || null,
+        youtube || null, website || null, whatsapp || null,
+        req.user.id, creatorName, JSON.stringify(photos || [])
+      ]
     );
 
     // Add creator to club
@@ -981,7 +997,7 @@ app.post('/api/clubs', authenticateToken, async (req, res) => {
     res.json(result.rows[0]);
   } catch (error) {
     console.error('Error creating club:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Failed to create club', details: error.message });
   }
 });
 
