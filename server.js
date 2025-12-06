@@ -967,13 +967,26 @@ app.delete('/api/clubs/:id/leave', authenticateToken, async (req, res) => {
 
 // Delete club (admin only)
 app.delete('/api/clubs/:id', authenticateToken, requireAdmin, async (req, res) => {
+  const clubId = parseInt(req.params.id);
+  
   try {
-    const { id } = req.params;
-    await pool.query('DELETE FROM clubs WHERE id = $1', [id]);
-    res.json({ message: 'Club deleted' });
+    // 1. First delete all club memberships
+    await pool.query('DELETE FROM club_memberships WHERE club_id = $1', [clubId]);
+    
+    // 2. Update related projects (set club_id to NULL)
+    await pool.query('UPDATE projects SET club_id = NULL WHERE club_id = $1', [clubId]);
+    
+    // 3. Now delete the club itself
+    const result = await pool.query('DELETE FROM clubs WHERE id = $1 RETURNING *', [clubId]);
+    
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'Club not found' });
+    }
+    
+    res.json({ success: true, message: 'Club deleted successfully' });
   } catch (error) {
     console.error('Error deleting club:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 });
 
