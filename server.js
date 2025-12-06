@@ -443,6 +443,17 @@ async function initializeDatabase() {
       )
     `);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        user_name VARCHAR(255) NOT NULL,
+        user_avatar VARCHAR(255),
+        text TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     console.log('Database schema initialized');
     await seedDatabase();
   } catch (error) {
@@ -1372,6 +1383,111 @@ app.post('/api/schedule', authenticateToken, async (req, res) => {
     res.json(result.rows[0]);
   } catch (error) {
     console.error('Error creating schedule:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============= CHAT ROUTES =============
+
+// Get all chat messages
+app.get('/api/chat/messages', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM chat_messages ORDER BY created_at ASC LIMIT 500'
+    );
+    
+    const messages = result.rows.map(row => ({
+      id: row.id,
+      userId: row.user_id,
+      userName: row.user_name,
+      userAvatar: row.user_avatar,
+      text: row.text,
+      createdAt: row.created_at
+    }));
+    
+    res.json(messages);
+  } catch (error) {
+    console.error('Error fetching chat messages:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Send chat message
+app.post('/api/chat/messages', authenticateToken, async (req, res) => {
+  try {
+    const { text } = req.body;
+    
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: 'Message text is required' });
+    }
+
+    // Get user info
+    const userResult = await pool.query(
+      'SELECT name, avatar FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = userResult.rows[0];
+    
+    const result = await pool.query(
+      `INSERT INTO chat_messages (user_id, user_name, user_avatar, text, created_at)
+       VALUES ($1, $2, $3, $4, NOW()) RETURNING *`,
+      [req.user.id, user.name, user.avatar, text.trim()]
+    );
+    
+    const row = result.rows[0];
+    res.json({
+      id: row.id,
+      userId: row.user_id,
+      userName: row.user_name,
+      userAvatar: row.user_avatar,
+      text: row.text,
+      createdAt: row.created_at
+    });
+  } catch (error) {
+    console.error('Error sending chat message:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete chat message (owner or admin only)
+app.delete('/api/chat/messages/:id', authenticateToken, async (req, res) => {
+  try {
+    const messageId = parseInt(req.params.id);
+    
+    // Check if user is admin
+    const userResult = await pool.query(
+      'SELECT is_admin FROM users WHERE id = $1',
+      [req.user.id]
+    );
+    const isAdmin = userResult.rows[0]?.is_admin;
+    
+    // Get message to check ownership
+    const messageResult = await pool.query(
+      'SELECT user_id FROM chat_messages WHERE id = $1',
+      [messageId]
+    );
+    
+    if (messageResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+    
+    const messageOwnerId = messageResult.rows[0].user_id;
+    
+    // Only owner or admin can delete
+    if (messageOwnerId !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'Not authorized to delete this message' });
+    }
+    
+    await pool.query('DELETE FROM chat_messages WHERE id = $1', [messageId]);
+    
+    res.json({ success: true, message: 'Message deleted' });
+  } catch (error) {
+    console.error('Error deleting chat message:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
