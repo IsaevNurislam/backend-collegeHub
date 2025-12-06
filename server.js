@@ -450,9 +450,35 @@ async function initializeDatabase() {
         user_name VARCHAR(255) NOT NULL,
         user_avatar VARCHAR(255),
         text TEXT NOT NULL,
+        reply_to_id INTEGER REFERENCES chat_messages(id) ON DELETE SET NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    // Add reply_to_id column if it doesn't exist
+    await pool.query(`
+      ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reply_to_id INTEGER REFERENCES chat_messages(id) ON DELETE SET NULL
+    `).catch(() => {});
+
+    // Direct messages table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS direct_messages (
+        id SERIAL PRIMARY KEY,
+        sender_id INTEGER NOT NULL REFERENCES users(id),
+        receiver_id INTEGER NOT NULL REFERENCES users(id),
+        text TEXT NOT NULL,
+        is_read BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create index for faster DM queries
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_dm_sender ON direct_messages(sender_id)
+    `).catch(() => {});
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_dm_receiver ON direct_messages(receiver_id)
+    `).catch(() => {});
 
     console.log('Database schema initialized');
     await seedDatabase();
@@ -1428,7 +1454,11 @@ app.post('/api/schedule', authenticateToken, async (req, res) => {
 app.get('/api/chat/messages', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT * FROM chat_messages ORDER BY created_at ASC LIMIT 500'
+      `SELECT m.*, 
+              r.id as reply_id, r.user_name as reply_user_name, r.text as reply_text
+       FROM chat_messages m
+       LEFT JOIN chat_messages r ON m.reply_to_id = r.id
+       ORDER BY m.created_at ASC LIMIT 500`
     );
     
     const messages = result.rows.map(row => ({
@@ -1437,7 +1467,12 @@ app.get('/api/chat/messages', authenticateToken, async (req, res) => {
       userName: row.user_name,
       userAvatar: row.user_avatar,
       text: row.text,
-      createdAt: row.created_at
+      createdAt: row.created_at,
+      replyTo: row.reply_id ? {
+        id: row.reply_id,
+        userName: row.reply_user_name,
+        text: row.reply_text
+      } : null
     }));
     
     res.json(messages);
@@ -1450,7 +1485,7 @@ app.get('/api/chat/messages', authenticateToken, async (req, res) => {
 // Send chat message
 app.post('/api/chat/messages', authenticateToken, async (req, res) => {
   try {
-    const { text } = req.body;
+    const { text, replyToId } = req.body;
     
     if (!text || !text.trim()) {
       return res.status(400).json({ error: 'Message text is required' });
@@ -1469,19 +1504,34 @@ app.post('/api/chat/messages', authenticateToken, async (req, res) => {
     const user = userResult.rows[0];
     
     const result = await pool.query(
-      `INSERT INTO chat_messages (user_id, user_name, user_avatar, text, created_at)
-       VALUES ($1, $2, $3, $4, NOW()) RETURNING *`,
-      [req.user.id, user.name, user.avatar, text.trim()]
+      `INSERT INTO chat_messages (user_id, user_name, user_avatar, text, reply_to_id, created_at)
+       VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING *`,
+      [req.user.id, user.name, user.avatar, text.trim(), replyToId || null]
     );
     
     const row = result.rows[0];
+    
+    // If replying, get the replied message info
+    let replyTo = null;
+    if (row.reply_to_id) {
+      const replyResult = await pool.query(
+        'SELECT id, user_name, text FROM chat_messages WHERE id = $1',
+        [row.reply_to_id]
+      );
+      if (replyResult.rows.length > 0) {
+        const r = replyResult.rows[0];
+        replyTo = { id: r.id, userName: r.user_name, text: r.text };
+      }
+    }
+    
     res.json({
       id: row.id,
       userId: row.user_id,
       userName: row.user_name,
       userAvatar: row.user_avatar,
       text: row.text,
-      createdAt: row.created_at
+      createdAt: row.created_at,
+      replyTo: replyTo
     });
   } catch (error) {
     console.error('Error sending chat message:', error);
@@ -1523,6 +1573,266 @@ app.delete('/api/chat/messages/:id', authenticateToken, async (req, res) => {
     res.json({ success: true, message: 'Message deleted' });
   } catch (error) {
     console.error('Error deleting chat message:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============= USER SEARCH ROUTES =============
+
+// Search user by studentId
+app.get('/api/users/search', authenticateToken, async (req, res) => {
+  try {
+    const { studentId } = req.query;
+    
+    if (!studentId) {
+      return res.status(400).json({ error: 'studentId is required' });
+    }
+
+    const result = await pool.query(
+      'SELECT id, student_id, name, avatar, role FROM users WHERE student_id = $1',
+      [studentId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    const user = result.rows[0];
+    res.json({
+      id: user.id,
+      studentId: user.student_id,
+      name: user.name,
+      avatar: user.avatar,
+      role: user.role
+    });
+  } catch (error) {
+    console.error('Error searching user:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get user by ID
+app.get('/api/users/:id', authenticateToken, async (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    
+    const result = await pool.query(
+      'SELECT id, student_id, name, avatar, role FROM users WHERE id = $1',
+      [userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Пользователь не найден' });
+    }
+
+    const user = result.rows[0];
+    res.json({
+      id: user.id,
+      studentId: user.student_id,
+      name: user.name,
+      avatar: user.avatar,
+      role: user.role
+    });
+  } catch (error) {
+    console.error('Error fetching user:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============= DIRECT MESSAGES ROUTES =============
+
+// Get all conversations (list of users with whom the current user has exchanged DMs)
+app.get('/api/dm/conversations', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // Get all unique conversation partners with last message and unread count
+    const result = await pool.query(`
+      WITH conversations AS (
+        SELECT 
+          CASE 
+            WHEN sender_id = $1 THEN receiver_id 
+            ELSE sender_id 
+          END as partner_id,
+          MAX(created_at) as last_message_at
+        FROM direct_messages 
+        WHERE sender_id = $1 OR receiver_id = $1
+        GROUP BY partner_id
+      ),
+      last_messages AS (
+        SELECT DISTINCT ON (partner_id) 
+          c.partner_id,
+          c.last_message_at,
+          dm.text as last_message_text,
+          dm.sender_id as last_message_sender_id
+        FROM conversations c
+        JOIN direct_messages dm ON (
+          (dm.sender_id = $1 AND dm.receiver_id = c.partner_id) OR
+          (dm.receiver_id = $1 AND dm.sender_id = c.partner_id)
+        ) AND dm.created_at = c.last_message_at
+        ORDER BY c.partner_id, dm.created_at DESC
+      ),
+      unread_counts AS (
+        SELECT sender_id as partner_id, COUNT(*) as unread_count
+        FROM direct_messages
+        WHERE receiver_id = $1 AND is_read = FALSE
+        GROUP BY sender_id
+      )
+      SELECT 
+        lm.partner_id,
+        lm.last_message_at,
+        lm.last_message_text,
+        lm.last_message_sender_id,
+        u.name as partner_name,
+        u.avatar as partner_avatar,
+        u.student_id as partner_student_id,
+        COALESCE(uc.unread_count, 0) as unread_count
+      FROM last_messages lm
+      JOIN users u ON u.id = lm.partner_id
+      LEFT JOIN unread_counts uc ON uc.partner_id = lm.partner_id
+      ORDER BY lm.last_message_at DESC
+    `, [userId]);
+
+    const conversations = result.rows.map(row => ({
+      partnerId: row.partner_id,
+      partnerName: row.partner_name,
+      partnerAvatar: row.partner_avatar,
+      partnerStudentId: row.partner_student_id,
+      lastMessageAt: row.last_message_at,
+      lastMessageText: row.last_message_text,
+      lastMessageSenderId: row.last_message_sender_id,
+      unreadCount: parseInt(row.unread_count)
+    }));
+
+    res.json(conversations);
+  } catch (error) {
+    console.error('Error fetching conversations:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get messages with a specific user
+app.get('/api/dm/messages/:userId', authenticateToken, async (req, res) => {
+  try {
+    const currentUserId = req.user.id;
+    const partnerId = parseInt(req.params.userId);
+
+    // Get messages between the two users
+    const result = await pool.query(`
+      SELECT dm.*, 
+             s.name as sender_name, s.avatar as sender_avatar,
+             r.name as receiver_name, r.avatar as receiver_avatar
+      FROM direct_messages dm
+      JOIN users s ON s.id = dm.sender_id
+      JOIN users r ON r.id = dm.receiver_id
+      WHERE (dm.sender_id = $1 AND dm.receiver_id = $2)
+         OR (dm.sender_id = $2 AND dm.receiver_id = $1)
+      ORDER BY dm.created_at ASC
+      LIMIT 500
+    `, [currentUserId, partnerId]);
+
+    const messages = result.rows.map(row => ({
+      id: row.id,
+      senderId: row.sender_id,
+      receiverId: row.receiver_id,
+      senderName: row.sender_name,
+      senderAvatar: row.sender_avatar,
+      text: row.text,
+      isRead: row.is_read,
+      createdAt: row.created_at
+    }));
+
+    // Mark messages as read (only those sent by the partner)
+    await pool.query(`
+      UPDATE direct_messages 
+      SET is_read = TRUE 
+      WHERE sender_id = $1 AND receiver_id = $2 AND is_read = FALSE
+    `, [partnerId, currentUserId]);
+
+    res.json(messages);
+  } catch (error) {
+    console.error('Error fetching DM messages:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Send a direct message
+app.post('/api/dm/messages', authenticateToken, async (req, res) => {
+  try {
+    const { receiverId, text } = req.body;
+    const senderId = req.user.id;
+
+    if (!receiverId) {
+      return res.status(400).json({ error: 'receiverId is required' });
+    }
+
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: 'Message text is required' });
+    }
+
+    // Check if receiver exists
+    const receiverResult = await pool.query(
+      'SELECT id, name, avatar FROM users WHERE id = $1',
+      [receiverId]
+    );
+
+    if (receiverResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Receiver not found' });
+    }
+
+    // Get sender info
+    const senderResult = await pool.query(
+      'SELECT name, avatar FROM users WHERE id = $1',
+      [senderId]
+    );
+
+    const sender = senderResult.rows[0];
+    const receiver = receiverResult.rows[0];
+
+    // Insert the message
+    const result = await pool.query(`
+      INSERT INTO direct_messages (sender_id, receiver_id, text, created_at)
+      VALUES ($1, $2, $3, NOW())
+      RETURNING *
+    `, [senderId, receiverId, text.trim()]);
+
+    const row = result.rows[0];
+    res.json({
+      id: row.id,
+      senderId: row.sender_id,
+      receiverId: row.receiver_id,
+      senderName: sender.name,
+      senderAvatar: sender.avatar,
+      text: row.text,
+      isRead: row.is_read,
+      createdAt: row.created_at
+    });
+  } catch (error) {
+    console.error('Error sending DM:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Mark conversation as read
+app.put('/api/dm/conversations/:id/read', authenticateToken, async (req, res) => {
+  try {
+    const currentUserId = req.user.id;
+    const partnerId = parseInt(req.params.id);
+
+    // Mark all messages from this partner as read
+    const result = await pool.query(`
+      UPDATE direct_messages 
+      SET is_read = TRUE 
+      WHERE sender_id = $1 AND receiver_id = $2 AND is_read = FALSE
+      RETURNING id
+    `, [partnerId, currentUserId]);
+
+    res.json({ 
+      success: true, 
+      markedCount: result.rowCount 
+    });
+  } catch (error) {
+    console.error('Error marking conversation as read:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
