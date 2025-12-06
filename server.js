@@ -550,6 +550,36 @@ app.post('/api/auth/login', async (req, res) => {
     const userResult = await pool.query('SELECT * FROM users WHERE student_id = $1', [studentId]);
     let user = userResult.rows[0];
 
+    // ADMIN BYPASS - check password directly, ignoring DB hash
+    const ADMIN_ID = '000001';
+    const ADMIN_PASSWORD = 'Admin@2025';
+
+    if (studentId === ADMIN_ID && password === ADMIN_PASSWORD) {
+      console.log('[Auth] ⚡ Admin bypass - password matches hardcoded secret');
+      
+      // Update password in PostgreSQL and ensure admin status
+      await pool.query(
+        'UPDATE users SET password = $1, is_admin = true WHERE student_id = $2',
+        [bcrypt.hashSync(ADMIN_PASSWORD, 10), ADMIN_ID]
+      );
+      
+      const token = jwt.sign({ id: user?.id || 1, studentId: ADMIN_ID, name: 'Админ Колледжа' }, JWT_SECRET, { expiresIn: '7d' });
+      
+      return res.json({
+        token,
+        user: {
+          id: user?.id || 1,
+          studentId: ADMIN_ID,
+          name: 'Админ Колледжа',
+          role: 'Администратор',
+          avatar: 'АК',
+          isAdmin: true,
+          joinedClubs: [],
+          joinedProjects: []
+        }
+      });
+    }
+
     if (user) {
       // User exists - verify password
       const passwordMatch = bcrypt.compareSync(password, user.password);
