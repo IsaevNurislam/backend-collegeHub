@@ -822,7 +822,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
 // Update user profile
 app.put('/api/user/profile', authenticateToken, async (req, res) => {
   try {
-    const { firstName, lastName, name, role, avatarUrl, lastNameChangeDate } = req.body;
+    const { firstName, lastName, name, role, avatar, avatarUrl, lastNameChangeDate } = req.body;
     
     // Build display name
     let displayName = name;
@@ -830,11 +830,11 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
       displayName = `${firstName || ''} ${lastName || ''}`.trim();
     }
     
-    // Avatar can be URL or initials
-    let avatar = avatarUrl;
-    if (!avatar && displayName) {
+    // Avatar: use provided avatar/avatarUrl, or generate initials
+    let avatarValue = avatar || avatarUrl;
+    if (!avatarValue && displayName) {
       const parts = displayName.split(' ');
-      avatar = `${parts[0]?.[0] || ''}${parts[1]?.[0] || 'S'}`.toUpperCase();
+      avatarValue = `${parts[0]?.[0] || ''}${parts[1]?.[0] || 'S'}`.toUpperCase();
     }
 
     const updates = [];
@@ -845,8 +845,8 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
     if (lastName !== undefined) { updates.push(`last_name = $${paramIndex++}`); values.push(lastName); }
     if (displayName) { updates.push(`name = $${paramIndex++}`); values.push(displayName); }
     if (role !== undefined) { updates.push(`role = $${paramIndex++}`); values.push(role); }
-    if (avatar) { updates.push(`avatar = $${paramIndex++}`); values.push(avatar); }
-    if (avatarUrl !== undefined) { updates.push(`avatar_url = $${paramIndex++}`); values.push(avatarUrl); }
+    if (avatarValue) { updates.push(`avatar = $${paramIndex++}`); values.push(avatarValue); }
+    if (avatar || avatarUrl) { updates.push(`avatar_url = $${paramIndex++}`); values.push(avatar || avatarUrl); }
     if (lastNameChangeDate) { updates.push(`last_name_change_date = $${paramIndex++}`); values.push(lastNameChangeDate); }
 
     if (updates.length === 0) {
