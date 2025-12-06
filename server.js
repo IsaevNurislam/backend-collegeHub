@@ -684,28 +684,62 @@ app.get('/api/news', authenticateToken, async (req, res) => {
     const result = await pool.query(
       'SELECT * FROM news ORDER BY created_at DESC LIMIT 100'
     );
-    res.json(result.rows);
+    
+    // Get user's likes
+    const likesResult = await pool.query(
+      'SELECT news_id FROM news_likes WHERE user_id = $1',
+      [req.user.id]
+    );
+    const likedIds = likesResult.rows.map(r => r.news_id);
+    
+    const news = result.rows.map(row => ({
+      id: row.id,
+      author: row.author,
+      authorKey: row.author_key,
+      time: row.time,
+      timeKey: row.time_key,
+      content: row.content,
+      contentKey: row.content_key,
+      tags: typeof row.tags === 'string' ? JSON.parse(row.tags) : (row.tags || []),
+      tagsKeys: typeof row.tags_keys === 'string' ? JSON.parse(row.tags_keys) : (row.tags_keys || []),
+      likes: row.likes,
+      comments: row.comments,
+      liked: likedIds.includes(row.id)
+    }));
+    
+    res.json(news);
   } catch (error) {
     console.error('Error fetching news:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Internal server error', details: error.message });
   }
 });
 
 // Create news
 app.post('/api/news', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { author, time, content, tags } = req.body;
+    const { author, content, tags } = req.body;
+    const time = req.body.time || 'только что';
 
     const result = await pool.query(
       `INSERT INTO news (author, time, content, tags, likes, comments)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [author, time, content, JSON.stringify(tags || []), 0, 0]
+       VALUES ($1, $2, $3, $4, 0, 0) RETURNING *`,
+      [author || 'Админ Колледжа', time, content, JSON.stringify(tags || [])]
     );
 
-    res.json(result.rows[0]);
+    const row = result.rows[0];
+    res.json({
+      id: row.id,
+      author: row.author,
+      time: row.time,
+      content: row.content,
+      tags: typeof row.tags === 'string' ? JSON.parse(row.tags) : (row.tags || []),
+      likes: row.likes,
+      comments: row.comments,
+      liked: false
+    });
   } catch (error) {
     console.error('Error creating news:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ error: 'Failed to add news', details: error.message });
   }
 });
 
